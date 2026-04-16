@@ -1,30 +1,60 @@
 "use client";
 
 import React from "react";
-import { 
-  User, 
-  History, 
-  Settings, 
+import {
+  User,
+  History,
+  Settings,
   CreditCard,
   ShieldAlert,
   Wallet,
   ArrowDownLeft,
   ArrowUpRight
 } from "lucide-react";
+import { useAccount, useBalance } from "wagmi";
+import { MOCK_USDC_ADDRESS } from "@/lib/contracts";
 
 export default function ProfilePage() {
+  const { address, isConnected } = useAccount();
+
+  const { data: ethBalance } = useBalance({ address });
+  const { data: usdcBalance } = useBalance({
+    address,
+    token: MOCK_USDC_ADDRESS,
+  });
+
+  const fmtEth = (val: bigint | undefined) => {
+    if (val === undefined) return "—";
+    return (Number(val) / 1e18).toLocaleString("en-US", { maximumFractionDigits: 4 }) + " ETH";
+  };
+
+  const fmtUsdc = (val: bigint | undefined) => {
+    if (val === undefined) return "—";
+    return (Number(val) / 1e6).toLocaleString("en-US", { maximumFractionDigits: 2 }) + " USDC";
+  };
+
+  const shortAddr = address
+    ? `${address.slice(0, 6)}…${address.slice(-4)}`
+    : "Not connected";
+
   return (
     <div className="p-8 max-w-6xl mx-auto space-y-8 animate-in slide-in-from-bottom-4 duration-700">
       <div className="flex items-center gap-6 mb-4">
         <div className="w-20 h-20 rounded-3xl bg-white/5 border border-white/10 flex items-center justify-center relative group">
           <User size={32} className="text-gray-400 group-hover:text-white transition-colors" />
-          <div className="absolute -bottom-1 -right-1 w-6 h-6 bg-green-500 border-4 border-background rounded-full"></div>
+          {isConnected && (
+            <div className="absolute -bottom-1 -right-1 w-6 h-6 bg-green-500 border-4 border-background rounded-full" />
+          )}
         </div>
         <div className="space-y-1">
-          <h2 className="text-3xl font-bold tracking-tight">0x1A...8BAC</h2>
+          <h2 className="text-3xl font-bold tracking-tight font-mono">{shortAddr}</h2>
           <div className="flex gap-3">
-             <span className="text-[10px] bg-brand-cyan/10 text-brand-cyan px-2 py-0.5 rounded border border-brand-cyan/20 font-mono uppercase">Verified Account</span>
-             <span className="text-[10px] bg-white/5 text-gray-500 px-2 py-0.5 rounded border border-white/10 font-mono uppercase tracking-widest">Mainnet Ready</span>
+            <span className="text-[10px] bg-brand-cyan/10 text-brand-cyan px-2 py-0.5 rounded border border-brand-cyan/20 font-mono uppercase">
+              {isConnected ? "Connected" : "Not Connected"}
+            </span>
+            <span className="text-[10px] bg-white/5 text-gray-500 px-2 py-0.5 rounded border border-white/10 font-mono uppercase tracking-widest">
+              Sepolia
+            </span>
           </div>
         </div>
       </div>
@@ -33,16 +63,15 @@ export default function ProfilePage() {
         {/* Account summary */}
         <div className="lg:col-span-2 space-y-8">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <SummaryCard 
-              label="Net Worth" 
-              value="$12,342.12" 
-              icon={<Wallet className="text-brand-blue" />} 
+            <SummaryCard
+              label="ETH Balance"
+              value={fmtEth(ethBalance?.value)}
+              icon={<Wallet className="text-brand-blue" />}
             />
-            <SummaryCard 
-              label="Active Health" 
-              value="1.82" 
-              icon={<ShieldAlert className="text-green-400" />} 
-              isWarning={false}
+            <SummaryCard
+              label="USDC Balance"
+              value={fmtUsdc(usdcBalance?.value)}
+              icon={<ShieldAlert className="text-brand-cyan" />}
             />
           </div>
 

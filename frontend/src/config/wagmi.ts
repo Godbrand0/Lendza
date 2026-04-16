@@ -1,25 +1,17 @@
 import { connectorsForWallets } from "@rainbow-me/rainbowkit";
-import { 
-  metaMaskWallet, 
-  rainbowWallet, 
-  coinbaseWallet, 
-  walletConnectWallet 
+import {
+  metaMaskWallet,
+  rainbowWallet,
+  coinbaseWallet,
+  walletConnectWallet
 } from "@rainbow-me/rainbowkit/wallets";
 import { createConfig, http } from "wagmi";
-import { defineChain } from "viem";
+import { sepolia } from "viem/chains";
 
-// Define the Zama Sepolia Chain
-export const zamaSepolia = defineChain({
-  id: 8008135,
-  name: "Zama Sepolia",
-  nativeCurrency: { name: "ZAMA", symbol: "ZAMA", decimals: 18 },
-  rpcUrls: {
-    default: { http: ["https://api.sepolia.zama.ai"] },
-  },
-  blockExplorers: {
-    default: { name: "Zama Explorer", url: "https://explorer.zama.ai" },
-  },
-});
+// Zama Protocol runs ON Ethereum Sepolia (chain 11155111).
+// It is not a separate chain — it is a coprocessor layer on top of Sepolia.
+// See: https://docs.zama.ai/protocol/protocol/overview
+export { sepolia as zamaSepolia };
 
 const connectors = connectorsForWallets(
   [
@@ -36,9 +28,9 @@ const connectors = connectorsForWallets(
 
 export const config = createConfig({
   connectors,
-  chains: [zamaSepolia],
+  chains: [sepolia],
   transports: {
-    [zamaSepolia.id]: http(),
+    [sepolia.id]: http(),
   },
   ssr: true,
 });

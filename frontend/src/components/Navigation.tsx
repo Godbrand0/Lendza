@@ -14,6 +14,8 @@ import {
 } from "lucide-react";
 import { useFhe } from "@/context/FheContext";
 import { ConnectButton } from "@rainbow-me/rainbowkit";
+import { useBalance, useAccount } from "wagmi";
+import { MOCK_USDC_ADDRESS } from "@/lib/contracts";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -31,7 +33,7 @@ export function Sidebar() {
   return (
     <div className="w-64 shrink-0 h-screen glass border-r border-white/5 flex flex-col p-6 sticky top-0 overflow-y-auto">
       <div className="flex items-center gap-3 mb-10 px-2">
-        <div className="w-8 h-8 bg-gradient-to-tr from-brand-blue to-brand-cyan rounded-lg flex items-center justify-center glow-shadow">
+        <div className="w-8 h-8 bg-linear-to-tr from-brand-blue to-brand-cyan rounded-lg flex items-center justify-center glow-shadow">
           <Lock className="text-dark w-4 h-4" />
         </div>
         <span className="font-bold text-lg tracking-tight">ARGEN <span className="text-brand-cyan">×</span> ZAMA</span>
@@ -75,6 +77,20 @@ export function Sidebar() {
 }
 
 export function Header() {
+  const { address } = useAccount();
+
+  const { data: ethBalance } = useBalance({ address });
+  const { data: usdcBalance } = useBalance({
+    address,
+    token: MOCK_USDC_ADDRESS,
+  });
+
+  const fmt = (val: bigint | undefined, decimals: number) => {
+    if (val === undefined) return "—";
+    const n = Number(val) / 10 ** decimals;
+    return n.toLocaleString("en-US", { maximumFractionDigits: 4 });
+  };
+
   return (
     <header className="flex justify-between items-center py-4 px-8 sticky top-0 bg-background/50 backdrop-blur-xl z-50 border-b border-white/5">
       <div className="flex items-center gap-4">
@@ -82,12 +98,28 @@ export function Header() {
           Testnet v0.4
         </div>
       </div>
-      <div className="flex items-center gap-3 scale-90 origin-right">
-        <ConnectButton 
-          accountStatus="address"
-          chainStatus="icon"
-          showBalance={false}
-        />
+
+      <div className="flex items-center gap-3">
+        {address && (
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white/5 border border-white/10">
+            <span className="text-[11px] font-mono text-gray-300">
+              {fmt(ethBalance?.value, 18)}{" "}
+              <span className="text-gray-500">ETH</span>
+            </span>
+            <span className="text-white/10">|</span>
+            <span className="text-[11px] font-mono text-gray-300">
+              {fmt(usdcBalance?.value, 6)}{" "}
+              <span className="text-gray-500">USDC</span>
+            </span>
+          </div>
+        )}
+        <div className="scale-90 origin-right">
+          <ConnectButton
+            accountStatus="address"
+            chainStatus="icon"
+            showBalance={false}
+          />
+        </div>
       </div>
     </header>
   );
