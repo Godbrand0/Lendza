@@ -312,40 +312,62 @@ contract ConfidentialCounter is ZamaEthereumConfig {
 
 ---
 
-## 12. Frontend Integration (fhevmjs)
+## 12. Frontend Integration (@zama-fhe/relayer-sdk)
+
+> **Do not use `fhevmjs`** — it is deprecated. Use `@zama-fhe/relayer-sdk` instead.
+>
+> ```bash
+> npm install @zama-fhe/relayer-sdk
+> ```
+>
+> For Next.js / browser apps, always import from the `/bundle` sub-path so WASM
+> is pre-bundled and no Node.js polyfills are needed.
+
+### Step 1 — Load WASM once (call before anything else)
 
 ```typescript
-import { createInstance } from "@zama-ai/fhevmjs";
-import { BrowserProvider } from "ethers";
+import { initSDK } from "@zama-fhe/relayer-sdk/bundle";
 
-const provider = new BrowserProvider(window.ethereum);
-const instance = await createInstance({ provider });
-
-// Encrypt a value before sending to the contract
-const { handles, inputProof } = await instance.createEncryptedInput(
-  contractAddress,
-  await signer.getAddress()
-)
-  .add64(BigInt(borrowAmount)) // matches externalEuint64 parameter
-  .encrypt();
-
-// Call the contract
-await vault.borrow(handles[0], inputProof, { value: ethers.parseEther("1") });
+await initSDK(); // loads TFHE + TKMS WASM
 ```
 
-### Reencrypt (user reads their own encrypted value)
+### Step 2 — Create an instance (after wallet connects)
 
 ```typescript
-// User signs an EIP-712 message to prove ownership, then:
+import { initSDK, createInstance, SepoliaConfig } from "@zama-fhe/relayer-sdk/bundle";
+import { BrowserProvider } from "ethers";
+
+await initSDK();
+
+const config = { ...SepoliaConfig, network: window.ethereum };
+const instance = await createInstance(config);
+```
+
+### Step 3 — Encrypt inputs and call the contract
+
+```typescript
+// externalEuint64 → bytes32 in the ABI, inputProof → bytes
+const input = instance.createEncryptedInput(contractAddress, userAddress);
+input.add64(BigInt(borrowAmountUSDC)); // 6-decimal USDC units
+const { handles, inputProof } = await input.encrypt();
+
+// handles[0] is Uint8Array (32 bytes) — ethers encodes it as bytes32
+// inputProof  is Uint8Array              — ethers encodes it as bytes
+await vault.borrow(handles[0], inputProof, { value: parseEther("1") });
+```
+
+### Step 4 — Reencrypt (user reads their own encrypted value)
+
+```typescript
 const { publicKey, privateKey } = instance.generateKeypair();
 const eip712 = instance.createEIP712(publicKey, contractAddress);
 const signature = await signer.signTypedData(
   eip712.domain, eip712.types, eip712.message
 );
 
-const encryptedBalance = await contract.confidentialBalanceOf(userAddress);
+const encHandle = await contract.confidentialBalanceOf(userAddress);
 const balance = await instance.reencrypt(
-  encryptedBalance,
+  encHandle,
   privateKey,
   publicKey,
   signature,
@@ -353,6 +375,42 @@ const balance = await instance.reencrypt(
   userAddress
 );
 console.log("Balance:", balance); // plaintext bigint
+```
+
+### Next.js WASM configuration (next.config.ts)
+
+```typescript
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  webpack: (config, { isServer }) => {
+    config.experiments = { ...config.experiments, asyncWebAssembly: true };
+    if (!isServer) {
+      config.resolve.fallback = {
+        ...config.resolve.fallback,
+        fs: false, net: false, tls: false, crypto: false,
+      };
+    }
+    return config;
+  },
+};
+export default nextConfig;
+```
+
+### React context pattern (wallet + FHE instance lifecycle)
+
+```typescript
+// Only call initSDK() once; only call createInstance() after wallet connects.
+// Gate all contract calls on both `instance` and `signer` being non-null.
+
+const { instance, account, signer, connect } = useFhe();
+
+// In a form submit handler:
+const input = instance.createEncryptedInput(VAULT_ADDRESS, account);
+input.add64(usdcUnits);
+const { handles, inputProof } = await input.encrypt();
+const tx = await vaultContract(signer).borrow(handles[0], inputProof, { value });
+await tx.wait();
 ```
 
 ---
@@ -482,10 +540,60 @@ function resolveCheck(bytes calldata result, ...) external {
 
 ---
 
-## 15. Deployment Checklist
+## 15. Sepolia Infrastructure Addresses
+
+These addresses are for Ethereum Sepolia. `ZamaEthereumConfig` configures the first five
+automatically — you do **not** hardcode them. The one you DO use explicitly is `DECRYPTION_ADDRESS`.
+
+| Name | Address | Who uses it |
+|---|---|---|
+| `FHEVM_EXECUTOR_CONTRACT` | `0x92C920834Ec8941d2C77D188936E1f7A6f49c127` | Auto via `ZamaEthereumConfig` |
+| `ACL_CONTRACT` | `0xf0Ffdc93b7E186bC2f8CB3dAA75D86d1930A433D` | Auto via `ZamaEthereumConfig` |
+| `HCU_LIMIT_CONTRACT` | `0xa10998783c8CF88D886Bc30307e631D6686F0A22` | Auto via `ZamaEthereumConfig` |
+| `KMS_VERIFIER_CONTRACT` | `0xbE0E383937d564D7FF0BC3b46c51f0bF8d5C311A` | Auto via `ZamaEthereumConfig` |
+| `INPUT_VERIFIER_CONTRACT` | `0xBBC1fFCdc7C316aAAd72E807D9b0272BE8F84DA0` | Auto via `ZamaEthereumConfig` |
+| `DECRYPTION_ADDRESS` | `0x5D8BD78e2ea6bbE41f26dFe9fdaEAa349e077478` | **Your contract** — gate callbacks to this |
+| `INPUT_VERIFICATION_ADDRESS` | `0x483b9dE06E4E4C7D35CCf5837A1668487406D955` | Auto via `FHE.fromExternal()` |
+| `RELAYER_URL` | `https://relayer.testnet.zama.org` | `.env` / relayer SDK config |
+| `GATEWAY_CHAIN_ID` | `10901` | `.env` / relayer SDK config |
+
+### Gating decryption callbacks to DECRYPTION_ADDRESS
+
+```solidity
+address public constant DECRYPTION_ADDRESS = 0x5D8BD78e2ea6bbE41f26dFe9fdaEAa349e077478;
+
+error OnlyDecryptor();
+
+modifier onlyDecryptor() {
+    if (msg.sender != DECRYPTION_ADDRESS) revert OnlyDecryptor();
+    _;
+}
+
+/// @notice Zama relayer calls this after decrypting the FHE result.
+function resolveHealthCheck(
+    address borrower,
+    bytes calldata abiEncodedClearResult,
+    bytes calldata decryptionProof
+) external onlyDecryptor {
+    // FHE.checkSignatures() still runs for cryptographic verification
+    bytes32[] memory cts = new bytes32[](1);
+    cts[0] = FHE.toBytes32(_pendingCheck[borrower]);
+    FHE.checkSignatures(cts, abiEncodedClearResult, decryptionProof);
+    // ...
+}
+```
+
+> **Note for tests:** On local Hardhat (mock environment), skip the `onlyDecryptor` guard
+> or override `DECRYPTION_ADDRESS` to a test signer. The mock environment does not use the
+> real relayer.
+
+---
+
+## 16. Deployment Checklist
 
 ```
 □ All contracts inherit ZamaEthereumConfig
+□ Decryption callbacks gated with onlyDecryptor (DECRYPTION_ADDRESS = 0x5D8B...)
 □ Every FHE.add/sub/mul result has FHE.allowThis() + FHE.allow(owner)
 □ Every cross-contract handle transfer uses FHE.allowTransient()
 □ Every FHE.fromExternal() validates the inputProof
@@ -515,7 +623,7 @@ import {ZamaEthereumConfig} from "@fhevm/solidity/config/ZamaConfig.sol";
 ## 17. Architecture Summary (ARGEN × ZAMA Reference)
 
 ```
-Browser (fhevmjs)
+Browser (@zama-fhe/relayer-sdk)
   └─ encrypt(amount)  →  externalEuint64 + inputProof
         │
         ▼

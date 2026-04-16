@@ -49,6 +49,10 @@ contract ConfidentialVault is ZamaEthereumConfig {
     // Constants
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// @notice Zama relayer address on Sepolia that calls resolveHealthCheck().
+    ///         Source: https://docs.zama.org/protocol — DECRYPTION_ADDRESS.
+    address public constant DECRYPTION_ADDRESS = 0x5D8BD78e2ea6bbE41f26dFe9fdaEAa349e077478;
+
     /// @notice LTV threshold constant. Position is unhealthy when
     ///         collateralValue * 100 < debtValue * LIQUIDATION_THRESHOLD.
     uint64 public constant LIQUIDATION_THRESHOLD = 150_000;
@@ -103,6 +107,7 @@ contract ConfidentialVault is ZamaEthereumConfig {
 
     error OnlyOwner();
     error OnlyAuction();
+    error OnlyDecryptor();
     error NoCollateral();
     error NoPendingCheck();
     error AlreadyPendingCheck();
@@ -112,6 +117,11 @@ contract ConfidentialVault is ZamaEthereumConfig {
     // ─────────────────────────────────────────────────────────────────────────
     // Constructor
     // ─────────────────────────────────────────────────────────────────────────
+
+    modifier onlyDecryptor() {
+        if (msg.sender != DECRYPTION_ADDRESS) revert OnlyDecryptor();
+        _;
+    }
 
     constructor(address _oracle, address _cETH, address _cUSDC) {
         owner = msg.sender;
@@ -255,7 +265,7 @@ contract ConfidentialVault is ZamaEthereumConfig {
         address borrower,
         bytes calldata abiEncodedClearResult,
         bytes calldata decryptionProof
-    ) external {
+    ) external onlyDecryptor {
         ebool pendingCheck = _pendingHealthCheck[borrower];
         if (!FHE.isInitialized(pendingCheck)) revert NoPendingCheck();
 

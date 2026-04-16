@@ -92,7 +92,11 @@ contract DutchAuction is ZamaEthereumConfig {
     // Errors
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// @notice Zama relayer address on Sepolia that calls resolveBid().
+    address public constant DECRYPTION_ADDRESS = 0x5D8BD78e2ea6bbE41f26dFe9fdaEAa349e077478;
+
     error OnlyVault();
+    error OnlyDecryptor();
     error AuctionNotActive();
     error AuctionAlreadySettled();
     error AuctionExpired();
@@ -107,6 +111,11 @@ contract DutchAuction is ZamaEthereumConfig {
     // ─────────────────────────────────────────────────────────────────────────
     // Constructor
     // ─────────────────────────────────────────────────────────────────────────
+
+    modifier onlyDecryptor() {
+        if (msg.sender != DECRYPTION_ADDRESS) revert OnlyDecryptor();
+        _;
+    }
 
     constructor(address _vault) {
         vault = _vault;
@@ -234,7 +243,7 @@ contract DutchAuction is ZamaEthereumConfig {
         address bidder,
         bytes calldata abiEncodedClearResult,
         bytes calldata decryptionProof
-    ) external {
+    ) external onlyDecryptor {
         Auction storage auction = auctions[auctionId];
         if (!_isActive[auctionId]) revert AuctionNotActive();
         if (auction.settled) revert AuctionAlreadySettled();
