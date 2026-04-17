@@ -75,6 +75,10 @@ contract DutchAuction is ZamaEthereumConfig {
     /// @dev Pending resolution ebool, stored so resolveAuction() can verify proof.
     mapping(uint256 => mapping(address => ebool)) private _pendingValid;
 
+    /// @dev Tracks whether a resolution is pending per (auctionId, bidder).
+    ///      Separate bool required because `delete` cannot be applied to ebool.
+    mapping(uint256 => mapping(address => bool)) private _hasPendingValid;
+
     uint256[] private _activeAuctionIds;
     mapping(uint256 => bool) private _isActive;
 
@@ -217,6 +221,7 @@ contract DutchAuction is ZamaEthereumConfig {
         ebool valid = FHE.ge(bid.encMaxBid, FHE.asEuint64(currentPriceGwei));
 
         _pendingValid[auctionId][bidder] = valid;
+        _hasPendingValid[auctionId][bidder] = true;
         FHE.allowThis(valid);
 
         bid.resolutionPending = true;
@@ -261,7 +266,7 @@ contract DutchAuction is ZamaEthereumConfig {
 
         bid.resolutionPending = false;
         bid.resolved = true;
-        delete _pendingValid[auctionId][bidder];
+        _hasPendingValid[auctionId][bidder] = false;
 
         if (isValid) {
             bid.won = true;

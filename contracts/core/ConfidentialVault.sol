@@ -83,6 +83,10 @@ contract ConfidentialVault is ZamaEthereumConfig {
     /// @dev Pending health-check ebool handles, awaiting relayer decryption.
     mapping(address => ebool) private _pendingHealthCheck;
 
+    /// @dev Tracks whether a health-check is currently pending for a borrower.
+    ///      Separate bool required because `delete` cannot be applied to ebool.
+    mapping(address => bool) private _hasPendingCheck;
+
     /// @dev Agent address that triggered a given health check (for fee attribution).
     mapping(address => address) private _triggerAgent;
 
@@ -230,7 +234,7 @@ contract ConfidentialVault is ZamaEthereumConfig {
     /// @dev tx.origin captures the EOA that paid gas — used only for fee attribution.
     function requestLiquidationCheck(address borrower) external {
         if (!_isActive[borrower]) revert NoCollateral();
-        if (FHE.isInitialized(_pendingHealthCheck[borrower])) revert AlreadyPendingCheck();
+        if (_hasPendingCheck[borrower]) revert AlreadyPendingCheck();
 
         uint64 price = oracle.getEthUsdPrice(); // plain integer, e.g. 3000
 
@@ -246,6 +250,7 @@ contract ConfidentialVault is ZamaEthereumConfig {
 
         // Persist handle so resolveHealthCheck() can verify the proof.
         _pendingHealthCheck[borrower] = isUnhealthy;
+        _hasPendingCheck[borrower] = true;
         FHE.allowThis(isUnhealthy);
 
         // Hand handle to the Zama relayer for public decryption.
@@ -267,7 +272,7 @@ contract ConfidentialVault is ZamaEthereumConfig {
         bytes calldata decryptionProof
     ) external onlyDecryptor {
         ebool pendingCheck = _pendingHealthCheck[borrower];
-        if (!FHE.isInitialized(pendingCheck)) revert NoPendingCheck();
+        if (!_hasPendingCheck[borrower]) revert NoPendingCheck();
 
         // Verify the decryption proof against the stored handle.
         bytes32[] memory cts = new bytes32[](1);
@@ -277,7 +282,7 @@ contract ConfidentialVault is ZamaEthereumConfig {
         bool isUnhealthy = abi.decode(abiEncodedClearResult, (bool));
 
         // Clear the pending check.
-        delete _pendingHealthCheck[borrower];
+        _hasPendingCheck[borrower] = false;
 
         emit HealthCheckResolved(borrower, isUnhealthy);
 

@@ -4,9 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start:monitor": "ts-node src/monitor.ts",
-    "start:bidder": "ts-node src/bidder.ts",
+    "start:monitor": "ts-node agents/monitor/index.ts",
+    "start:bidder:alpha": "ts-node agents/bidder-alpha/index.ts",
+    "start:bidder:discount": "ts-node agents/bidder-discount/index.ts",
+    "start:bidder:sniper": "ts-node agents/bidder-sniper/index.ts",
     "start:server": "ts-node server/index.ts",
+    "start:all": "concurrently --names \"monitor,alpha,discount,sniper\" --prefix-colors \"cyan,green,yellow,magenta\" --kill-others-on-fail \"ts-node agents/monitor/index.ts\" \"ts-node agents/bidder-alpha/index.ts\" \"ts-node agents/bidder-discount/index.ts\" \"ts-node agents/bidder-sniper/index.ts\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -17,6 +20,7 @@
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^25.6.0",
+    "concurrently": "^9.2.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "ethers": "^6.16.0",
