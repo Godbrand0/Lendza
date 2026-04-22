@@ -78,21 +78,30 @@ export default function BorrowPage() {
   const totalDue = position.totalDue ?? (knownDebt !== null ? knownDebt + calcInterest(knownDebt, elapsedMinutes) : null);
 
   async function handleRepay() {
-    if (!signer || !account || !VAULT_ADDRESS || totalDue === null) return;
+    if (!signer || !account || !VAULT_ADDRESS) return;
     setRepayStatus("encrypting"); // reuse state label for "approving"
     setRepayError(null);
     setRepayTxHash(null);
     try {
-      const usdcUnits = BigInt(Math.round(totalDue * 1e6));
+      // Re-fetch totalDue fresh at repay time — the stale page-load value may
+      // be lower than what the contract will compute (interest accrues by minute).
+      const vault = vaultContract(signer);
+      const freshDue = await vault.getMyTotalDue();
+      const freshPrincipal = Number(freshDue[1]);   // USDC units (6 decimals)
+      const freshTotal     = Number(freshDue[0]);   // principal + current interest
 
-      // Step 1: approve vault to spend totalDue USDC
+      // Add 5 minutes of buffer so the approval covers the approve tx confirmation window.
+      const INTEREST_PER_MIN_BPS = 100;
+      const buffer = Math.ceil((freshPrincipal * INTEREST_PER_MIN_BPS * 5) / 10_000);
+      const usdcUnits = BigInt(freshTotal + buffer);
+
+      // Step 1: approve vault to spend totalDue + buffer USDC
       const usdc = mockUsdcContract(signer);
       const approveTx = await usdc.approve(VAULT_ADDRESS, usdcUnits);
       await approveTx.wait();
 
       // Step 2: repay — vault pulls USDC and releases ETH
       setRepayStatus("pending");
-      const vault = vaultContract(signer);
       const tx = await vault.repay();
       setRepayTxHash(tx.hash);
       await tx.wait();
@@ -106,7 +115,7 @@ export default function BorrowPage() {
   }
 
   const canRepay = !!signer && !!account && position.loan?.isActive
-    && !position.loan.isOverdue && totalDue !== null && repayStatus === "idle";
+    && !position.loan.isOverdue && repayStatus === "idle";
 
   // Derived
   const principal = parseFloat(borrowAmt) || 0;

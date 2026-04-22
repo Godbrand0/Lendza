@@ -12,13 +12,16 @@ dotenv.config();
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 export const config = {
-  rpcUrl:          process.env.RPC_URL          || "http://localhost:8545",
-  vaultAddress:    process.env.VAULT_ADDRESS    || "",
-  auctionAddress:  process.env.AUCTION_ADDRESS  || "",
-  monitorKey:      process.env.MONITOR_PRIVATE_KEY || "",
-  bidderAlphaKey:  process.env.BIDDER_ALPHA_PRIVATE_KEY || "",
-  bidderDiscountKey: process.env.BIDDER_DISCOUNT_PRIVATE_KEY || "",
-  bidderSniperKey: process.env.BIDDER_SNIPER_PRIVATE_KEY || "",
+  rpcUrl:           process.env.RPC_URL               || "http://localhost:8545",
+  vaultAddress:     process.env.VAULT_ADDRESS          || "",
+  auctionAddress:   process.env.AUCTION_ADDRESS        || "",
+  monitorKey:       process.env.MONITOR_PRIVATE_KEY    || "",
+  bidderAlphaKey:   process.env.BIDDER_ALPHA_PRIVATE_KEY   || "",
+  bidderDiscountKey:process.env.BIDDER_DISCOUNT_PRIVATE_KEY || "",
+  bidderSniperKey:  process.env.BIDDER_SNIPER_PRIVATE_KEY  || "",
+  // x402 payment layer
+  x402ServerUrl:    process.env.X402_SERVER_URL        || "",
+  mockUsdcAddress:  process.env.MOCK_USDC_ADDRESS      || "0x9b5Cd13b8eFbB58Dc25A05CF411D8056058aDFfF",
 };
 
 // ─── ABIs ────────────────────────────────────────────────────────────────────

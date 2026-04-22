@@ -36,7 +36,7 @@ async function main() {
     // 2. Prepare an encrypted bid (e.g., $2500 max bid)
     console.log(`[Bidder] Preparing encrypted bid for auction #${auctionId}...`);
     
-    const clearBid = 2500; // Plan to pay up to $2500
+    const clearBid = 2500n; // Plan to pay up to $2500
     const encryptedInput = await fhevm
       .createEncryptedInput(AUCTION_ADDRESS, wallet.address)
       .add64(clearBid)

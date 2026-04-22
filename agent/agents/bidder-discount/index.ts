@@ -4,42 +4,33 @@
  * Strategy:
  *   Watches each active auction and polls the current price every 30 seconds.
  *   Only bids once the price has dropped to or below TARGET_DISCOUNT_PCT of
- *   the auction's start price. Balances profit margin against the risk that
- *   another bidder wins first.
+ *   the auction's start price.
  *
- *   Dutch auction price schedule:
- *     startPrice  = 100% of collateral ETH value
- *     floor price = 70%  of collateral ETH value  (FLOOR_BPS = 7000)
- *     duration    = 3600 seconds (1 hour)
- *     price at t  = startPrice − (startPrice − floorPrice) × (t / 3600)
- *
- *   At TARGET_DISCOUNT_PCT = 85, the agent bids when the price has fallen to
- *   85% of start, which happens at t = (0.15 / 0.30) × 3600 = 1800 s (30 min).
- *
- * Earnings:
- *   Profit = market ETH price − (startPrice × TARGET_DISCOUNT_PCT / 100).
- *
- * Wallet needs:
- *   ETH ≥ (startPrice × TARGET_DISCOUNT_PCT / 100) + gas.
+ * x402 integration (when X402_SERVER_URL is set):
+ *   Pays 0.05 USDC at startup to get pre-enriched auction data including
+ *   current prices and discount percentages — avoids fetching each auction
+ *   individually and can immediately skip auctions already past their target.
  *
  * Env:
  *   RPC_URL, VAULT_ADDRESS, AUCTION_ADDRESS, BIDDER_DISCOUNT_PRIVATE_KEY
+ *   X402_SERVER_URL     — optional
+ *   MOCK_USDC_ADDRESS   — optional
  *   TARGET_DISCOUNT_PCT — price target as % of start price (default: 85)
  *   POLL_INTERVAL_MS    — how often to check price (default: 30000)
  */
 
 import { ethers } from "ethers";
 import { config, AUCTION_ABI, getFheInstance, makeLogger } from "../shared";
+import { X402Client, AuctionData } from "../x402client";
 
 const log = makeLogger("BidderDiscount");
 
 const TARGET_DISCOUNT_PCT = Number(process.env.TARGET_DISCOUNT_PCT || "85");
 const POLL_INTERVAL_MS    = Number(process.env.POLL_INTERVAL_MS    || "30000");
 
-// Per-auction state
 interface AuctionState {
   startPrice: bigint;
-  targetPrice: bigint;  // startPrice × TARGET_DISCOUNT_PCT / 100
+  targetPrice: bigint;
   bidSubmitted: boolean;
   pollTimer: ReturnType<typeof setInterval> | null;
 }
@@ -52,7 +43,7 @@ async function watchAuction(
   auctionId: bigint,
   startPrice: bigint,
 ) {
-  if (auctionStates.has(auctionId)) return; // already watching
+  if (auctionStates.has(auctionId)) return;
 
   const targetPrice = (startPrice * BigInt(TARGET_DISCOUNT_PCT)) / 100n;
 
@@ -71,7 +62,6 @@ async function watchAuction(
     try {
       currentPrice = await auction.getCurrentPrice(auctionId);
     } catch {
-      // Auction may have settled — stop polling
       clearInterval(state.pollTimer!);
       auctionStates.delete(auctionId);
       return;
@@ -82,9 +72,8 @@ async function watchAuction(
       `(target: ${ethers.formatEther(targetPrice)} ETH)`
     );
 
-    if (currentPrice > targetPrice) return; // not cheap enough yet
+    if (currentPrice > targetPrice) return;
 
-    // Price has hit our target — bid now
     clearInterval(state.pollTimer!);
     state.bidSubmitted = true;
 
@@ -97,34 +86,69 @@ async function watchAuction(
       const provider = auction.runner?.provider as ethers.Provider;
       const fhe      = await getFheInstance(provider);
 
-      // Use target price as our encrypted bid ceiling (we only bid at or below target)
-      const bidCeilingGwei = targetPrice; // already in gwei from contract
+      const bidCeilingGwei = targetPrice;
       const input = fhe.createEncryptedInput(config.auctionAddress, wallet.address);
       input.add64(bidCeilingGwei);
       const { handles, inputProof } = await input.encrypt();
 
       log.info(`Submitting bid — deposit: ${ethers.formatEther(currentPrice)} ETH`);
-      const tx = await auction.submitBid(auctionId, handles[0], inputProof, {
-        value: currentPrice,
-      });
+      const tx = await auction.submitBid(auctionId, handles[0], inputProof, { value: currentPrice });
       const receipt = await tx.wait();
       log.info(`Bid submitted — tx: ${receipt.hash}`);
 
-      // Request resolution immediately after bidding
       const resTx = await auction.requestBidResolution(auctionId, wallet.address);
       await resTx.wait();
       log.info(`Resolution requested for auction #${auctionId}`);
     } catch (e: any) {
       log.error(`Bid failed for auction #${auctionId}:`, e.message);
-      state.bidSubmitted = false; // allow retry on next poll
+      state.bidSubmitted = false;
       state.pollTimer = setInterval(poll, POLL_INTERVAL_MS);
     }
   };
 
-  // Poll immediately, then on interval
   await poll();
   if (!state.bidSubmitted) {
     state.pollTimer = setInterval(poll, POLL_INTERVAL_MS);
+  }
+}
+
+// ── Bootstrap ──────────────────────────────────────────────────────────────────
+
+async function bootstrapAuctions(
+  auction: ethers.Contract,
+  wallet: ethers.Wallet,
+  x402: X402Client | null,
+) {
+  if (x402) {
+    log.info(`Fetching live auctions via x402…`);
+    let auctions: AuctionData[];
+    try {
+      auctions = await x402.getAuctionData();
+      log.info(`x402: ${auctions.length} active auction(s)`);
+    } catch (e: any) {
+      log.warn(`x402 failed: ${e.message} — falling back to chain`);
+      auctions = [];
+    }
+
+    for (const a of auctions) {
+      const discountNum = parseFloat(a.discountPct);
+      const alreadyCheapEnough = discountNum >= (100 - TARGET_DISCOUNT_PCT);
+      log.info(
+        `Auction #${a.auctionId}: ${a.currentPrice} ETH ` +
+        `(${a.discountPct}% off, ${a.secondsRemaining}s remaining)` +
+        (alreadyCheapEnough ? " — already at/below target, bidding now" : "")
+      );
+      await watchAuction(auction, wallet, BigInt(a.auctionId), ethers.parseEther(a.startPrice))
+        .catch((e) => log.error(`Startup watch failed for #${a.auctionId}:`, e.message));
+    }
+  } else {
+    const active: bigint[] = await auction.getActiveAuctions();
+    log.info(`Found ${active.length} active auction(s) at startup (chain)`);
+    for (const id of active) {
+      const [, startPrice] = await auction.auctions(id);
+      await watchAuction(auction, wallet, id, startPrice)
+        .catch((e) => log.error(`Startup watch failed for #${id}:`, e.message));
+    }
   }
 }
 
@@ -138,53 +162,43 @@ async function main() {
 
   const balance = await provider.getBalance(wallet.address);
   log.info(`Starting discount bidder agent`);
-  log.info(`Wallet    : ${wallet.address}`);
-  log.info(`Balance   : ${ethers.formatEther(balance)} ETH`);
-  log.info(`Auction   : ${config.auctionAddress}`);
-  log.info(`Target    : ${TARGET_DISCOUNT_PCT}% of start price`);
-  log.info(`Poll      : every ${POLL_INTERVAL_MS / 1000}s`);
-  log.info(`Strategy  : wait for ${100 - TARGET_DISCOUNT_PCT}% price drop before bidding`);
+  log.info(`Wallet   : ${wallet.address}`);
+  log.info(`Balance  : ${ethers.formatEther(balance)} ETH`);
+  log.info(`Auction  : ${config.auctionAddress}`);
+  log.info(`Target   : ${TARGET_DISCOUNT_PCT}% of start price`);
+  log.info(`Poll     : every ${POLL_INTERVAL_MS / 1000}s`);
+  log.info(`Strategy : wait for ${100 - TARGET_DISCOUNT_PCT}% price drop before bidding`);
 
-  // ── Event listeners ──────────────────────────────────────────────────────
+  const x402 = config.x402ServerUrl
+    ? new X402Client(config.x402ServerUrl, wallet, config.mockUsdcAddress, (m) => log.info(m))
+    : null;
+
+  if (x402) log.info(`x402 server: ${config.x402ServerUrl}`);
+  else       log.info(`x402 server: not configured — using chain reads`);
+
+  // ── Event listeners ───────────────────────────────────────────────────────
 
   auction.on("AuctionStarted", async (auctionId: bigint, _borrower: string, startPrice: bigint) => {
-    await watchAuction(auction, wallet, auctionId, startPrice).catch((e) =>
-      log.error("watchAuction failed:", e.message)
-    );
+    await watchAuction(auction, wallet, auctionId, startPrice)
+      .catch((e) => log.error("watchAuction failed:", e.message));
   });
 
   auction.on("AuctionSettled", (auctionId: bigint, winner: string, pricePaid: bigint) => {
     const state = auctionStates.get(auctionId);
     if (state?.pollTimer) clearInterval(state.pollTimer);
     auctionStates.delete(auctionId);
-
     const won = winner.toLowerCase() === wallet.address.toLowerCase();
-    if (won) {
-      log.win(`WON auction #${auctionId} — paid ${ethers.formatEther(pricePaid)} ETH`);
-    } else {
-      log.info(`Auction #${auctionId} settled — won by ${winner}`);
-    }
+    if (won) log.win(`WON auction #${auctionId} — paid ${ethers.formatEther(pricePaid)} ETH`);
+    else     log.info(`Auction #${auctionId} settled — won by ${winner}`);
   });
 
   auction.on("BidRefunded", (auctionId: bigint, bidder: string) => {
-    if (bidder.toLowerCase() === wallet.address.toLowerCase()) {
+    if (bidder.toLowerCase() === wallet.address.toLowerCase())
       log.warn(`Deposit refunded for auction #${auctionId}`);
-    }
   });
 
-  // ── Catch auctions already live at startup ────────────────────────────────
-
-  const active: bigint[] = await auction.getActiveAuctions();
-  log.info(`Found ${active.length} active auction(s) at startup`);
-
-  for (const id of active) {
-    const [, startPrice] = await auction.auctions(id);
-    await watchAuction(auction, wallet, id, startPrice).catch((e) =>
-      log.error(`Startup watch failed for #${id}:`, e.message)
-    );
-  }
-
-  log.info(`Watching for new auctions...`);
+  await bootstrapAuctions(auction, wallet, x402);
+  log.info(`Watching for new auctions…`);
 }
 
 main().catch((e) => {
