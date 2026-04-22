@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import {FHE, euint64, externalEuint64, ebool} from "@fhevm/solidity/lib/FHE.sol";
 import {ZamaEthereumConfig} from "@fhevm/solidity/config/ZamaConfig.sol";
 
-import {IPriceOracle} from "../interfaces/IPriceOracle.sol";
 import {ConfidentialCollateral} from "../tokens/ConfidentialCollateral.sol";
 import {ConfidentialDebt} from "../tokens/ConfidentialDebt.sol";
 
@@ -63,22 +62,35 @@ contract ConfidentialVault is ZamaEthereumConfig {
     /// @notice Trigger agent receives 1% of collateral ETH as a fee.
     uint256 public constant TRIGGER_FEE_BPS = 100; // 1%
 
+    /// @notice Interest rate per minute in basis points (100 bps = 1%/min for demo).
+    uint256 public constant INTEREST_BPS_PER_MINUTE = 100;
+
+    /// @notice Hardcoded ETH price in USD (integer, e.g. 3000 = $3,000).
+    ///         Used for the on-chain FHE health check. Good enough for demo.
+    uint64 public constant ETH_PRICE_USD = 3000;
+
     // ─────────────────────────────────────────────────────────────────────────
     // State
     // ─────────────────────────────────────────────────────────────────────────
 
     address public owner;
-    IPriceOracle public oracle;
     ConfidentialCollateral public cETH;
     ConfidentialDebt public cUSDC;
     address public auctionContract;
 
-    /// @dev Tracks all borrowers that have opened a position.
+    /// @dev Tracks all borrowers that have opened a borrow position.
     address[] private _activePositions;
     mapping(address => bool) private _isActive;
 
+    /// @dev Tracks whether an address has deposited collateral (may or may not have borrowed).
+    mapping(address => bool) public hasCollateral;
+
     /// @dev ETH deposited as collateral per borrower (plaintext gwei for ETH accounting).
     mapping(address => uint256) public collateralGwei;
+
+    /// @dev Loan term and start time per borrower.
+    mapping(address => uint256) public loanStartTime;
+    mapping(address => uint256) public loanTermSeconds;
 
     /// @dev Pending health-check ebool handles, awaiting relayer decryption.
     mapping(address => ebool) private _pendingHealthCheck;
@@ -93,10 +105,23 @@ contract ConfidentialVault is ZamaEthereumConfig {
     /// @dev Lender liquidity balances (encrypted USDC).
     mapping(address => euint64) private _lenderBalance;
 
+    /// @dev Tracks lender addresses for count reporting.
+    address[] private _lenderAddresses;
+    /// @notice True if an address has ever deposited liquidity as a lender.
+    mapping(address => bool) public isLender;
+
+    /// @dev Running plaintext total of ETH collateral (in gwei) across all depositors.
+    uint256 public totalCollateralGwei;
+
+    /// @dev ETH received from auction settlements — stays in vault to back lenders.
+    uint256 public protocolEthEarnings;
+
     // ─────────────────────────────────────────────────────────────────────────
     // Events
     // ─────────────────────────────────────────────────────────────────────────
 
+    event CollateralDeposited(address indexed borrower, uint256 gweiAmount);
+    event CollateralWithdrawn(address indexed borrower, uint256 gweiAmount);
     event Borrowed(address indexed borrower);
     event Repaid(address indexed borrower);
     event LiquidityDeposited(address indexed lender);
@@ -116,7 +141,10 @@ contract ConfidentialVault is ZamaEthereumConfig {
     error NoPendingCheck();
     error AlreadyPendingCheck();
     error PositionActive();
+    error ActiveDebt();
     error ZeroCollateral();
+    error InvalidDuration();
+    error LoanOverdue();
 
     // ─────────────────────────────────────────────────────────────────────────
     // Constructor
@@ -127,9 +155,8 @@ contract ConfidentialVault is ZamaEthereumConfig {
         _;
     }
 
-    constructor(address _oracle, address _cETH, address _cUSDC) {
+    constructor(address _cETH, address _cUSDC) {
         owner = msg.sender;
-        oracle = IPriceOracle(_oracle);
         cETH = ConfidentialCollateral(_cETH);
         cUSDC = ConfidentialDebt(_cUSDC);
     }
@@ -144,44 +171,92 @@ contract ConfidentialVault is ZamaEthereumConfig {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Borrower: open / close position
+    // Borrower: step 1 — deposit / withdraw collateral
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Open a leveraged position: deposit ETH as collateral, borrow encrypted USDC.
+    /// @notice Deposit Sepolia ETH as collateral. Can be called multiple times to top up.
+    function depositCollateral() external payable {
+        if (msg.value == 0) revert ZeroCollateral();
+
+        uint256 gweiDeposited = msg.value / 1 gwei;
+        collateralGwei[msg.sender] += gweiDeposited;
+        hasCollateral[msg.sender] = true;
+        totalCollateralGwei += gweiDeposited;
+
+        // Mint encrypted cETH receipt to borrower (mint adds to existing balance).
+        euint64 encCollateral = FHE.asEuint64(uint64(gweiDeposited));
+        FHE.allowTransient(encCollateral, address(cETH));
+        cETH.mint(msg.sender, encCollateral);
+
+        emit CollateralDeposited(msg.sender, gweiDeposited);
+    }
+
+    /// @notice Withdraw collateral before borrowing. Reverts if debt is outstanding.
+    function withdrawCollateral() external {
+        if (!hasCollateral[msg.sender]) revert NoCollateral();
+        if (_isActive[msg.sender]) revert ActiveDebt();
+
+        uint256 gweiToReturn = collateralGwei[msg.sender];
+
+        // Burn cETH receipt.
+        euint64 encCollateral = FHE.asEuint64(uint64(gweiToReturn));
+        FHE.allowTransient(encCollateral, address(cETH));
+        cETH.burn(msg.sender, encCollateral);
+
+        totalCollateralGwei -= gweiToReturn;
+        collateralGwei[msg.sender] = 0;
+        hasCollateral[msg.sender] = false;
+
+        (bool ok, ) = msg.sender.call{value: gweiToReturn * 1 gwei}("");
+        require(ok, "ETH transfer failed");
+
+        emit CollateralWithdrawn(msg.sender, gweiToReturn);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Borrower: step 2 — borrow / repay USDC
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Borrow encrypted USDC against already-deposited ETH collateral.
     /// @param encBorrowAmount  Client-side FHE-encrypted borrow amount (USDC 6-dec units).
     /// @param inputProof       Proof generated by fhevmjs alongside the ciphertext.
-    function borrow(externalEuint64 encBorrowAmount, bytes calldata inputProof) external payable {
-        if (msg.value == 0) revert ZeroCollateral();
+    /// @param durationMinutes  Loan term in minutes (1–1440). Use small values for demo.
+    function borrow(
+        externalEuint64 encBorrowAmount,
+        bytes calldata inputProof,
+        uint256 durationMinutes
+    ) external {
+        if (!hasCollateral[msg.sender]) revert NoCollateral();
         if (_isActive[msg.sender]) revert PositionActive();
+        if (durationMinutes == 0 || durationMinutes > 1440) revert InvalidDuration();
 
         // Validate and decrypt the borrow amount inside the coprocessor.
         euint64 borrowAmount = FHE.fromExternal(encBorrowAmount, inputProof);
 
-        // Record plaintext ETH collateral for auction / withdrawal accounting.
-        uint256 gweiDeposited = msg.value / 1 gwei;
-        collateralGwei[msg.sender] = gweiDeposited;
-
-        // Mint cETH to borrower: encrypt the plaintext gwei amount.
-        euint64 encCollateral = FHE.asEuint64(uint64(gweiDeposited));
-        FHE.allowTransient(encCollateral, address(cETH));
-        cETH.mint(msg.sender, encCollateral);
+        // Record loan term.
+        loanStartTime[msg.sender] = block.timestamp;
+        loanTermSeconds[msg.sender] = durationMinutes * 60;
 
         // Mint cUSDC debt to borrower.
         FHE.allowTransient(borrowAmount, address(cUSDC));
         cUSDC.mint(msg.sender, borrowAmount);
 
-        // Track position.
+        // Track active borrow position.
         _isActive[msg.sender] = true;
         _activePositions.push(msg.sender);
 
         emit Borrowed(msg.sender);
     }
 
-    /// @notice Repay encrypted debt and reclaim ETH collateral.
+    /// @notice Repay encrypted USDC debt and reclaim ETH collateral.
     /// @param encRepayAmount  Encrypted USDC amount to repay.
     /// @param inputProof      Proof from fhevmjs.
     function repay(externalEuint64 encRepayAmount, bytes calldata inputProof) external {
         if (!_isActive[msg.sender]) revert NoCollateral();
+
+        // Block repay once the loan term has expired — position must be liquidated.
+        uint256 dueTime = loanStartTime[msg.sender] + loanTermSeconds[msg.sender];
+        if (block.timestamp > dueTime) revert LoanOverdue();
 
         euint64 repayAmount = FHE.fromExternal(encRepayAmount, inputProof);
 
@@ -195,8 +270,10 @@ contract ConfidentialVault is ZamaEthereumConfig {
         cETH.burn(msg.sender, encCollateral);
 
         uint256 ethToReturn = collateralGwei[msg.sender] * 1 gwei;
+        totalCollateralGwei -= collateralGwei[msg.sender];
         collateralGwei[msg.sender] = 0;
         _isActive[msg.sender] = false;
+        hasCollateral[msg.sender] = false;
         _removePosition(msg.sender);
 
         (bool ok, ) = msg.sender.call{value: ethToReturn}("");
@@ -217,12 +294,23 @@ contract ConfidentialVault is ZamaEthereumConfig {
             _lenderBalance[msg.sender] = FHE.add(_lenderBalance[msg.sender], amount);
         } else {
             _lenderBalance[msg.sender] = amount;
+            // Track new lender.
+            if (!isLender[msg.sender]) {
+                isLender[msg.sender] = true;
+                _lenderAddresses.push(msg.sender);
+            }
         }
 
         FHE.allowThis(_lenderBalance[msg.sender]);
         FHE.allow(_lenderBalance[msg.sender], msg.sender);
 
         emit LiquidityDeposited(msg.sender);
+    }
+
+    /// @notice Returns the encrypted lender balance handle for `account`.
+    ///         Caller must hold an FHE.allow grant (i.e., be the account) to userDecrypt it.
+    function getLenderBalanceHandle(address account) external view returns (euint64) {
+        return _lenderBalance[account];
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -236,7 +324,7 @@ contract ConfidentialVault is ZamaEthereumConfig {
         if (!_isActive[borrower]) revert NoCollateral();
         if (_hasPendingCheck[borrower]) revert AlreadyPendingCheck();
 
-        uint64 price = oracle.getEthUsdPrice(); // plain integer, e.g. 3000
+        uint64 price = ETH_PRICE_USD;
 
         // Retrieve encrypted handles owned by this contract.
         euint64 encCollateral = cETH.confidentialBalanceOf(borrower);
@@ -315,8 +403,10 @@ contract ConfidentialVault is ZamaEthereumConfig {
         cETH.burn(borrower, encCollateral);
 
         // Close position.
+        totalCollateralGwei -= collateralGwei[borrower];
         collateralGwei[borrower] = 0;
         _isActive[borrower] = false;
+        hasCollateral[borrower] = false;
         _removePosition(borrower);
         delete _triggerAgent[borrower];
 
@@ -326,8 +416,10 @@ contract ConfidentialVault is ZamaEthereumConfig {
             require(ok, "Trigger fee transfer failed");
         }
 
-        // Remaining ETH (ethPaid) stays in vault to cover lenders.
-        // Production: distribute ethPaid to lenders pro-rata.
+        // Track protocol ETH earnings from auction settlement.
+        // Remaining ETH after trigger fee stays in vault to back lenders.
+        uint256 remaining = ethPaid - triggerFee;
+        protocolEthEarnings += remaining;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -353,6 +445,20 @@ contract ConfidentialVault is ZamaEthereumConfig {
         return _activePositions;
     }
 
+    /// @notice Protocol-wide plaintext stats for the dashboard.
+    /// @return totalCollateral  Total ETH collateral locked, in gwei.
+    /// @return activeBorrowers  Number of open borrow positions.
+    /// @return totalLenders     Total number of lenders that have ever deposited.
+    function getProtocolStats() external view returns (
+        uint256 totalCollateral,
+        uint256 activeBorrowers,
+        uint256 totalLenders
+    ) {
+        totalCollateral = totalCollateralGwei;
+        activeBorrowers = _activePositions.length;
+        totalLenders = _lenderAddresses.length;
+    }
+
     /// @notice Returns the raw encrypted handles for a position.
     ///         Caller must hold FHE.allow grants to reencrypt them.
     function getPositionHandles(address borrower)
@@ -362,6 +468,30 @@ contract ConfidentialVault is ZamaEthereumConfig {
     {
         encCollateral = cETH.confidentialBalanceOf(borrower);
         encDebt = cUSDC.confidentialBalanceOf(borrower);
+    }
+
+    /// @notice Returns plaintext loan timing info for a borrower.
+    /// @return startTime      Unix timestamp when loan was opened.
+    /// @return termSeconds    Loan duration in seconds.
+    /// @return dueTime        Unix timestamp when loan is due.
+    /// @return isOverdue      Whether the loan term has elapsed.
+    /// @return isActive       Whether the position is open.
+    function getLoanInfo(address borrower)
+        external
+        view
+        returns (
+            uint256 startTime,
+            uint256 termSeconds,
+            uint256 dueTime,
+            bool isOverdue,
+            bool isActive
+        )
+    {
+        startTime = loanStartTime[borrower];
+        termSeconds = loanTermSeconds[borrower];
+        dueTime = startTime + termSeconds;
+        isOverdue = startTime > 0 && block.timestamp > dueTime;
+        isActive = _isActive[borrower];
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -14,8 +14,7 @@ import "./tasks/FHECounter";
 
 // Run 'npx hardhat vars setup' to see the list of variables that need to be set
 
-const MNEMONIC: string = vars.get("MNEMONIC", "test test test test test test test test test test test junk");
-const INFURA_API_KEY: string = vars.get("INFURA_API_KEY", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+const PRIVATE_KEY: string = vars.get("PRIVATE_KEY", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 
 const config: HardhatUserConfig = {
   defaultNetwork: "hardhat",
@@ -34,28 +33,17 @@ const config: HardhatUserConfig = {
   },
   networks: {
     hardhat: {
-      accounts: {
-        mnemonic: MNEMONIC,
-      },
       chainId: 31337,
     },
     anvil: {
-      accounts: {
-        mnemonic: MNEMONIC,
-        path: "m/44'/60'/0'/0/",
-        count: 10,
-      },
+      accounts: [PRIVATE_KEY],
       chainId: 31337,
       url: "http://localhost:8545",
     },
     sepolia: {
-      accounts: {
-        mnemonic: MNEMONIC,
-        path: "m/44'/60'/0'/0/",
-        count: 10,
-      },
+      accounts: [PRIVATE_KEY],
       chainId: 11155111,
-      url: `https://sepolia.infura.io/v3/${INFURA_API_KEY}`,
+      url: "https://ethereum-sepolia-rpc.publicnode.com",
     },
   },
   paths: {

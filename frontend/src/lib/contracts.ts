@@ -26,12 +26,15 @@ export const MOCK_USDC_ADDRESS =
 
 export const VAULT_ABI = [
   {
-    "inputs": [{ "internalType": "address", "name": "_oracle", "type": "address" }, { "internalType": "address", "name": "_cETH", "type": "address" }, { "internalType": "address", "name": "_cUSDC", "type": "address" }],
+    "inputs": [{ "internalType": "address", "name": "_cETH", "type": "address" }, { "internalType": "address", "name": "_cUSDC", "type": "address" }],
     "stateMutability": "nonpayable",
     "type": "constructor"
   },
+  { "inputs": [], "name": "ActiveDebt", "type": "error" },
   { "inputs": [], "name": "AlreadyPendingCheck", "type": "error" },
+  { "inputs": [], "name": "InvalidDuration", "type": "error" },
   { "inputs": [], "name": "InvalidKMSSignatures", "type": "error" },
+  { "inputs": [], "name": "LoanOverdue", "type": "error" },
   { "inputs": [], "name": "NoCollateral", "type": "error" },
   { "inputs": [], "name": "NoPendingCheck", "type": "error" },
   { "inputs": [], "name": "OnlyAuction", "type": "error" },
@@ -45,6 +48,18 @@ export const VAULT_ABI = [
     "anonymous": false,
     "inputs": [{ "indexed": true, "internalType": "address", "name": "account", "type": "address" }, { "indexed": true, "internalType": "address", "name": "agent", "type": "address" }],
     "name": "AgentAccessGranted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [{ "indexed": true, "internalType": "address", "name": "borrower", "type": "address" }, { "indexed": false, "internalType": "uint256", "name": "gweiAmount", "type": "uint256" }],
+    "name": "CollateralDeposited",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [{ "indexed": true, "internalType": "address", "name": "borrower", "type": "address" }, { "indexed": false, "internalType": "uint256", "name": "gweiAmount", "type": "uint256" }],
+    "name": "CollateralWithdrawn",
     "type": "event"
   },
   {
@@ -125,10 +140,42 @@ export const VAULT_ABI = [
     "type": "function"
   },
   {
-    "inputs": [{ "internalType": "externalEuint64", "name": "encBorrowAmount", "type": "bytes32" }, { "internalType": "bytes", "name": "inputProof", "type": "bytes" }],
-    "name": "borrow",
+    "inputs": [],
+    "name": "depositCollateral",
     "outputs": [],
     "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "withdrawCollateral",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "address", "name": "", "type": "address" }],
+    "name": "hasCollateral",
+    "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "address", "name": "", "type": "address" }],
+    "name": "isLender",
+    "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      { "internalType": "externalEuint64", "name": "encBorrowAmount", "type": "bytes32" },
+      { "internalType": "bytes", "name": "inputProof", "type": "bytes" },
+      { "internalType": "uint256", "name": "durationMinutes", "type": "uint256" }
+    ],
+    "name": "borrow",
+    "outputs": [],
+    "stateMutability": "nonpayable",
     "type": "function"
   },
   {
@@ -181,6 +228,58 @@ export const VAULT_ABI = [
     "type": "function"
   },
   {
+    "inputs": [],
+    "name": "getProtocolStats",
+    "outputs": [
+      { "internalType": "uint256", "name": "totalCollateral", "type": "uint256" },
+      { "internalType": "uint256", "name": "activeBorrowers", "type": "uint256" },
+      { "internalType": "uint256", "name": "totalLenders", "type": "uint256" }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "address", "name": "account", "type": "address" }],
+    "name": "getLenderBalanceHandle",
+    "outputs": [{ "internalType": "euint64", "name": "", "type": "bytes32" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "totalCollateralGwei",
+    "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "address", "name": "borrower", "type": "address" }],
+    "name": "getLoanInfo",
+    "outputs": [
+      { "internalType": "uint256", "name": "startTime", "type": "uint256" },
+      { "internalType": "uint256", "name": "termSeconds", "type": "uint256" },
+      { "internalType": "uint256", "name": "dueTime", "type": "uint256" },
+      { "internalType": "bool", "name": "isOverdue", "type": "bool" },
+      { "internalType": "bool", "name": "isActive", "type": "bool" }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "address", "name": "", "type": "address" }],
+    "name": "loanStartTime",
+    "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "address", "name": "", "type": "address" }],
+    "name": "loanTermSeconds",
+    "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
     "inputs": [{ "internalType": "address", "name": "account", "type": "address" }, { "internalType": "address", "name": "agent", "type": "address" }],
     "name": "grantAgentAccess",
     "outputs": [],
@@ -189,8 +288,8 @@ export const VAULT_ABI = [
   },
   {
     "inputs": [],
-    "name": "oracle",
-    "outputs": [{ "internalType": "contract IPriceOracle", "name": "", "type": "address" }],
+    "name": "protocolEthEarnings",
+    "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
     "stateMutability": "view",
     "type": "function"
   },
@@ -388,6 +487,17 @@ export const AUCTION_ABI = [
     "type": "function"
   },
   { "stateMutability": "payable", "type": "receive" }
+] as const;
+
+// Minimal ABI for cETH and cUSDC — only what's needed for re-encryption handles.
+export const TOKEN_ABI = [
+  {
+    "inputs": [{ "internalType": "address", "name": "account", "type": "address" }],
+    "name": "confidentialBalanceOf",
+    "outputs": [{ "internalType": "euint64", "name": "", "type": "bytes32" }],
+    "stateMutability": "view",
+    "type": "function"
+  }
 ] as const;
 
 // ---------------------------------------------------------------------------

@@ -14,8 +14,8 @@ import {
 } from "lucide-react";
 import { useFhe } from "@/context/FheContext";
 import { ConnectButton } from "@rainbow-me/rainbowkit";
-import { useBalance, useAccount } from "wagmi";
-import { MOCK_USDC_ADDRESS } from "@/lib/contracts";
+import { useBalance, useAccount, useBlockNumber } from "wagmi";
+import { useEffect } from "react";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -79,17 +79,39 @@ export function Sidebar() {
 export function Header() {
   const { address } = useAccount();
 
-  const { data: ethBalance } = useBalance({ address });
-  const { data: usdcBalance } = useBalance({
+  // Watch new blocks — triggers refetch on every mined block
+  const { data: blockNumber } = useBlockNumber({ watch: true });
+
+  const { data: ethBalance, refetch: refetchEth } = useBalance({ address });
+
+  // Sepolia USDC (Circle) — this is the wallet's token balance.
+  // Note: vault deposits (lend) are FHE-encrypted and do NOT move this token,
+  // so this balance only changes if you receive/send USDC directly in your wallet.
+  const sepoliaUsdc = process.env.NEXT_PUBLIC_USDC_ADDRESS as `0x${string}` | undefined;
+  const { data: usdcBalance, refetch: refetchUsdc } = useBalance({
     address,
-    token: MOCK_USDC_ADDRESS,
+    token: sepoliaUsdc,
   });
 
-  const fmt = (val: bigint | undefined, decimals: number) => {
-    if (val === undefined) return "—";
-    const n = Number(val) / 10 ** decimals;
-    return n.toLocaleString("en-US", { maximumFractionDigits: 4 });
+  // Refetch both balances on every new block
+  useEffect(() => {
+    if (!address) return;
+    refetchEth();
+    refetchUsdc();
+  }, [blockNumber, address]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const fmtEth = (val: bigint | undefined) => {
+    if (val === undefined || !address) return null;
+    return (Number(val) / 1e18).toLocaleString("en-US", { maximumFractionDigits: 4 });
   };
+
+  const fmtUsdc = (val: bigint | undefined) => {
+    if (val === undefined || !address) return null;
+    return (Number(val) / 1e6).toLocaleString("en-US", { maximumFractionDigits: 2 });
+  };
+
+  const ethDisplay = fmtEth(ethBalance?.value);
+  const usdcDisplay = fmtUsdc(usdcBalance?.value);
 
   return (
     <header className="flex justify-between items-center py-4 px-8 sticky top-0 bg-background/50 backdrop-blur-xl z-50 border-b border-white/5">
@@ -100,17 +122,23 @@ export function Header() {
       </div>
 
       <div className="flex items-center gap-3">
-        {address && (
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white/5 border border-white/10">
-            <span className="text-[11px] font-mono text-gray-300">
-              {fmt(ethBalance?.value, 18)}{" "}
-              <span className="text-gray-500">ETH</span>
-            </span>
-            <span className="text-white/10">|</span>
-            <span className="text-[11px] font-mono text-gray-300">
-              {fmt(usdcBalance?.value, 6)}{" "}
-              <span className="text-gray-500">USDC</span>
-            </span>
+        {address && (ethDisplay !== null || usdcDisplay !== null) && (
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white/5 border border-white/10"
+               title="Wallet balances — vault deposits are shown on the Lend/Borrow pages">
+            {ethDisplay !== null && (
+              <span className="text-[11px] font-mono text-gray-300">
+                {ethDisplay} <span className="text-gray-500">ETH</span>
+              </span>
+            )}
+            {ethDisplay !== null && usdcDisplay !== null && (
+              <span className="text-white/10">|</span>
+            )}
+            {usdcDisplay !== null && (
+              <span className="text-[11px] font-mono text-gray-300">
+                {usdcDisplay} <span className="text-gray-500">USDC</span>
+              </span>
+            )}
+            <span className="text-[9px] text-gray-600 uppercase tracking-widest">wallet</span>
           </div>
         )}
         <div className="scale-90 origin-right">

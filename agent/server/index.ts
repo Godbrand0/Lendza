@@ -1,24 +1,31 @@
 /**
  * x402 Payment Server — Lendza Protocol
  *
- * Implements the x402 (HTTP 402 Payment Required) flow for gating FHE
- * position handle access. Agents pay a USDC fee to unlock read permissions
- * on encrypted borrower positions in the ConfidentialVault.
+ * Endpoints:
  *
- * Flow:
- *   1. Agent POSTs /v1/alpha        → server returns 402 with payment details
- *   2. Agent pays USDC on-chain
- *   3. Agent POSTs /v1/alpha/confirm → server verifies tx, calls grantAgentAccess()
- *   4. AgentAccessGranted fires on-chain → agent can read FHE handles
+ *  POST /v1/alpha              — probe: 200 (granted) or 402 (pay to unlock)
+ *  POST /v1/alpha/confirm      — submit payment tx → vault.grantAgentAccess()
+ *
+ *  POST /v1/positions/unhealthy         — probe: 200 or 402 (0.05 USDC)
+ *  POST /v1/positions/unhealthy/confirm — pay → receive overdue position list
+ *
+ *  POST /v1/auction/access         — probe: 200 or 402 (0.05 USDC)
+ *  POST /v1/auction/access/confirm — pay → receive live auction data
+ *
+ *  GET  /v1/grants             — list all granted (agent, borrower) pairs
+ *  GET  /health                — liveness check
  *
  * Required .env:
- *   RPC_URL              — JSON-RPC endpoint (Zama devnet or Sepolia)
- *   VAULT_ADDRESS        — ConfidentialVault contract address
- *   CUSDC_ADDRESS        — cUSDC token address (used for payment verification)
+ *   RPC_URL              — JSON-RPC endpoint
+ *   VAULT_ADDRESS        — ConfidentialVault address
+ *   AUCTION_ADDRESS      — DutchAuction address
+ *   CUSDC_ADDRESS        — cUSDC token address (payment verification)
+ *   USDC_ADDRESS         — real USDC token address (payment verification)
  *   ADMIN_PRIVATE_KEY    — wallet authorised to call vault.grantAgentAccess()
  *   PAYMENT_ADDRESS      — USDC receiving address for fee collection
- *   X402_FEE_USDC        — fee in 6-decimal USDC units (default: 10000000 = 10 USDC)
- *   SERVER_PORT          — port to listen on (default: 3001)
+ *   X402_FEE_USDC        — fee for alpha access in 6-dec units (default: 10 USDC)
+ *   X402_FEE_DATA_USDC   — fee for position/auction data (default: 50000 = 0.05 USDC)
+ *   SERVER_PORT          — port (default: 3001)
  */
 
 import express, { Request, Response, NextFunction } from "express";
@@ -35,19 +42,32 @@ dotenv.config();
 const {
   RPC_URL            = "http://localhost:8545",
   VAULT_ADDRESS      = "",
+  AUCTION_ADDRESS    = "",
   CUSDC_ADDRESS      = "",
+  USDC_ADDRESS       = "",
   ADMIN_PRIVATE_KEY  = "",
   PAYMENT_ADDRESS    = "",
-  X402_FEE_USDC      = "10000000",  // 10 USDC default
+  X402_FEE_USDC      = "10000000",   // 10 USDC — alpha FHE access
+  X402_FEE_DATA_USDC = "50000",      // 0.05 USDC — position/auction data
   SERVER_PORT        = "3001",
 } = process.env;
 
-const FEE = BigInt(X402_FEE_USDC);
+const ALPHA_FEE = BigInt(X402_FEE_USDC);
+const DATA_FEE  = BigInt(X402_FEE_DATA_USDC);
 
-// Only the function this server needs to call on the vault
+// Vault ABI — only what this server needs
 const VAULT_ABI = [
   "function grantAgentAccess(address account, address agent) external",
+  "function getActivePositions() external view returns (address[])",
+  "function getLoanInfo(address borrower) external view returns (uint256 startTime, uint256 termSeconds, uint256 dueTime, bool isOverdue, bool isActive)",
+  "function collateralGwei(address) external view returns (uint256)",
   "event AgentAccessGranted(address indexed account, address indexed agent)",
+];
+
+const AUCTION_ABI = [
+  "function getActiveAuctions() external view returns (uint256[])",
+  "function auctions(uint256) external view returns (address borrower, uint256 startPrice, uint256 floorPrice, uint256 startTime, bool settled)",
+  "function getCurrentPrice(uint256 auctionId) external view returns (uint256)",
 ];
 
 // ─── Ethers setup ─────────────────────────────────────────────────────────────
@@ -55,13 +75,15 @@ const VAULT_ABI = [
 const provider    = new ethers.JsonRpcProvider(RPC_URL);
 const adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
 const vault       = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, adminWallet);
+const auction     = AUCTION_ADDRESS
+  ? new ethers.Contract(AUCTION_ADDRESS, AUCTION_ABI, provider)
+  : null;
 
 // ─── Startup validation ───────────────────────────────────────────────────────
 
 function assertConfig() {
   const required: [string, string][] = [
     ["VAULT_ADDRESS",     VAULT_ADDRESS],
-    ["CUSDC_ADDRESS",     CUSDC_ADDRESS],
     ["ADMIN_PRIVATE_KEY", ADMIN_PRIVATE_KEY],
     ["PAYMENT_ADDRESS",   PAYMENT_ADDRESS],
   ];
@@ -72,11 +94,12 @@ function assertConfig() {
   }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
 function isAddress(v: unknown): v is string {
   return typeof v === "string" && ethers.isAddress(v);
 }
+
+// Payment token for data routes — prefer real USDC, fall back to cUSDC
+const DATA_PAYMENT_TOKEN = USDC_ADDRESS || CUSDC_ADDRESS;
 
 // ─── Express app ──────────────────────────────────────────────────────────────
 
@@ -89,22 +112,23 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({
     status: "ok",
     vault: VAULT_ADDRESS,
+    auction: AUCTION_ADDRESS || "not set",
     paymentAddress: PAYMENT_ADDRESS,
-    feeUsdc: `${(Number(FEE) / 1e6).toFixed(2)} USDC`,
+    alphaFee: `${(Number(ALPHA_FEE) / 1e6).toFixed(2)} USDC`,
+    dataFee:  `${(Number(DATA_FEE)  / 1e6).toFixed(4)} USDC`,
     network: RPC_URL,
   });
 });
 
-// ── POST /v1/alpha ─────────────────────────────────────────────────────────────
-// Step 1 of the x402 flow.
-// Returns 200 if access is already granted, or 402 with payment requirements.
+// ═════════════════════════════════════════════════════════════════════════════
+// /v1/alpha — FHE handle access (original flow)
+// ═════════════════════════════════════════════════════════════════════════════
+
 app.post("/v1/alpha", (req: Request, res: Response) => {
   const { agentAddress, borrowerAddress } = req.body ?? {};
 
   if (!isAddress(agentAddress) || !isAddress(borrowerAddress)) {
-    res.status(400).json({
-      error: "agentAddress and borrowerAddress must be valid EVM addresses.",
-    });
+    res.status(400).json({ error: "agentAddress and borrowerAddress must be valid EVM addresses." });
     return;
   }
 
@@ -113,119 +137,212 @@ app.post("/v1/alpha", (req: Request, res: Response) => {
       granted: true,
       agentAddress,
       borrowerAddress,
-      message:
-        "Access already granted. Call getPositionHandles(borrower) on the Vault.",
+      message: "Access already granted. Call getPositionHandles(borrower) on the Vault.",
     });
     return;
   }
 
-  // Return 402 with everything the agent needs to complete payment
   res.status(402).json({
     granted: false,
-    // Payment details
     payTo: PAYMENT_ADDRESS,
-    amount: Number(FEE),                           // raw 6-decimal integer
-    amountFormatted: `${(Number(FEE) / 1e6).toFixed(2)} USDC`,
+    amount: Number(ALPHA_FEE),
+    amountFormatted: `${(Number(ALPHA_FEE) / 1e6).toFixed(2)} USDC`,
     currency: "USDC",
-    tokenAddress: CUSDC_ADDRESS,
+    tokenAddress: DATA_PAYMENT_TOKEN,
     network: RPC_URL,
-    // What is unlocked after payment
-    description:
-      "Payment grants your agent FHE read access to the borrower's encrypted position handles via vault.grantAgentAccess().",
-    // How to confirm
+    description: "Payment grants your agent FHE read access to the borrower's encrypted position handles via vault.grantAgentAccess().",
     confirmEndpoint: "POST /v1/alpha/confirm",
     requiredFields: ["agentAddress", "borrowerAddress", "txHash"],
   });
 });
 
-// ── POST /v1/alpha/confirm ────────────────────────────────────────────────────
-// Step 2 of the x402 flow.
-// Agent submits their payment txHash; server verifies on-chain then grants access.
 app.post("/v1/alpha/confirm", async (req: Request, res: Response) => {
   const { agentAddress, borrowerAddress, txHash } = req.body ?? {};
 
   if (!isAddress(agentAddress) || !isAddress(borrowerAddress)) {
-    res.status(400).json({
-      error: "agentAddress and borrowerAddress must be valid EVM addresses.",
-    });
+    res.status(400).json({ error: "agentAddress and borrowerAddress must be valid EVM addresses." });
     return;
   }
+  if (typeof txHash !== "string" || !txHash.startsWith("0x")) {
+    res.status(400).json({ error: "txHash must be a 0x-prefixed hex string." });
+    return;
+  }
+
+  if (hasGrant(agentAddress, borrowerAddress)) {
+    res.status(200).json({ granted: true, message: "Access was already granted." });
+    return;
+  }
+
+  console.log(`[x402/alpha] Verifying payment tx ${txHash}...`);
+  const result = await verifyPayment(provider, txHash, DATA_PAYMENT_TOKEN, PAYMENT_ADDRESS, ALPHA_FEE);
+  if (!result.ok) {
+    res.status(402).json({ granted: false, error: result.reason });
+    return;
+  }
+
+  try {
+    const tx      = await vault.grantAgentAccess(borrowerAddress, agentAddress);
+    const receipt = await tx.wait();
+    recordGrant({ agentAddress, borrowerAddress, txHash, onChainTx: receipt.hash, grantedAt: new Date().toISOString() });
+    res.status(200).json({
+      granted: true, agentAddress, borrowerAddress, onChainTx: receipt.hash,
+      message: "FHE read access granted. Call getPositionHandles(borrower) on the Vault.",
+    });
+  } catch (e: any) {
+    res.status(500).json({ granted: false, error: "On-chain grant failed.", detail: e.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// /v1/positions/unhealthy — pay 0.05 USDC to get overdue position list
+// ═════════════════════════════════════════════════════════════════════════════
+
+app.post("/v1/positions/unhealthy", (_req: Request, res: Response) => {
+  res.status(402).json({
+    granted: false,
+    payTo: PAYMENT_ADDRESS,
+    amount: Number(DATA_FEE),
+    amountFormatted: `${(Number(DATA_FEE) / 1e6).toFixed(4)} USDC`,
+    currency: "USDC",
+    tokenAddress: DATA_PAYMENT_TOKEN,
+    network: RPC_URL,
+    description: "Pay 0.05 USDC to receive the list of all overdue borrow positions eligible for liquidation.",
+    confirmEndpoint: "POST /v1/positions/unhealthy/confirm",
+    requiredFields: ["txHash"],
+  });
+});
+
+app.post("/v1/positions/unhealthy/confirm", async (req: Request, res: Response) => {
+  const { txHash } = req.body ?? {};
 
   if (typeof txHash !== "string" || !txHash.startsWith("0x")) {
     res.status(400).json({ error: "txHash must be a 0x-prefixed hex string." });
     return;
   }
 
-  // Idempotent — if already granted, just confirm it
-  if (hasGrant(agentAddress, borrowerAddress)) {
-    res.status(200).json({
-      granted: true,
-      message: "Access was already granted for this (agent, borrower) pair.",
-    });
-    return;
-  }
-
-  // ── 1. Verify the USDC transfer on-chain ──────────────────────────────────
-  console.log(`[x402] Verifying payment tx ${txHash} for agent ${agentAddress}...`);
-
-  const result = await verifyPayment(
-    provider,
-    txHash,
-    CUSDC_ADDRESS,
-    PAYMENT_ADDRESS,
-    FEE
-  );
-
+  console.log(`[x402/unhealthy] Verifying payment tx ${txHash}...`);
+  const result = await verifyPayment(provider, txHash, DATA_PAYMENT_TOKEN, PAYMENT_ADDRESS, DATA_FEE);
   if (!result.ok) {
-    console.warn(`[x402] Payment verification failed: ${result.reason}`);
     res.status(402).json({ granted: false, error: result.reason });
     return;
   }
 
-  console.log(`[x402] Payment verified — ${result.amount} USDC units from ${result.from}`);
-
-  // ── 2. Call vault.grantAgentAccess(borrower, agent) on-chain ─────────────
-  let onChainTx: string;
   try {
-    console.log(
-      `[x402] Calling grantAgentAccess(${borrowerAddress}, ${agentAddress})...`
+    // Fetch all active positions and filter to overdue ones
+    const positions: string[] = await vault.getActivePositions();
+    const now = Math.floor(Date.now() / 1000);
+
+    const overdue: Array<{
+      borrower: string;
+      collateralEth: string;
+      dueTime: number;
+      overdueSeconds: number;
+    }> = [];
+
+    await Promise.all(
+      positions.map(async (borrower) => {
+        try {
+          const [, , dueTime, isOverdue] = await vault.getLoanInfo(borrower);
+          if (isOverdue) {
+            const gwei: bigint = await vault.collateralGwei(borrower);
+            overdue.push({
+              borrower,
+              collateralEth: ethers.formatEther(gwei * 1_000_000_000n),
+              dueTime: Number(dueTime),
+              overdueSeconds: now - Number(dueTime),
+            });
+          }
+        } catch { /* skip */ }
+      })
     );
-    const tx      = await vault.grantAgentAccess(borrowerAddress, agentAddress);
-    const receipt = await tx.wait();
-    onChainTx     = receipt.hash;
-    console.log(`[x402] Access granted — tx: ${onChainTx}`);
-  } catch (e: any) {
-    console.error("[x402] grantAgentAccess failed:", e.message);
-    res.status(500).json({
-      granted: false,
-      error:
-        "On-chain grant call failed. Ensure the server wallet is authorised on the Vault.",
-      detail: e.message,
+
+    console.log(`[x402/unhealthy] Payment verified — returning ${overdue.length} overdue position(s)`);
+    res.status(200).json({
+      granted: true,
+      count: overdue.length,
+      positions: overdue,
+      note: "Call vault.requestLiquidationCheck(borrower) for each position to trigger FHE health evaluation.",
     });
-    return;
+  } catch (e: any) {
+    res.status(500).json({ error: "Failed to fetch positions.", detail: e.message });
   }
+});
 
-  // ── 3. Persist the grant ──────────────────────────────────────────────────
-  recordGrant({
-    agentAddress,
-    borrowerAddress,
-    txHash,
-    onChainTx,
-    grantedAt: new Date().toISOString(),
-  });
+// ═════════════════════════════════════════════════════════════════════════════
+// /v1/auction/access — pay 0.05 USDC to get live auction data
+// ═════════════════════════════════════════════════════════════════════════════
 
-  res.status(200).json({
-    granted: true,
-    agentAddress,
-    borrowerAddress,
-    onChainTx,
-    message:
-      "FHE read access granted. Your agent wallet can now call getPositionHandles(borrower) on the Vault.",
+app.post("/v1/auction/access", (_req: Request, res: Response) => {
+  res.status(402).json({
+    granted: false,
+    payTo: PAYMENT_ADDRESS,
+    amount: Number(DATA_FEE),
+    amountFormatted: `${(Number(DATA_FEE) / 1e6).toFixed(4)} USDC`,
+    currency: "USDC",
+    tokenAddress: DATA_PAYMENT_TOKEN,
+    network: RPC_URL,
+    description: "Pay 0.05 USDC to receive live auction data including current prices and collateral details.",
+    confirmEndpoint: "POST /v1/auction/access/confirm",
+    requiredFields: ["txHash"],
   });
 });
 
+app.post("/v1/auction/access/confirm", async (req: Request, res: Response) => {
+  const { txHash } = req.body ?? {};
+
+  if (typeof txHash !== "string" || !txHash.startsWith("0x")) {
+    res.status(400).json({ error: "txHash must be a 0x-prefixed hex string." });
+    return;
+  }
+
+  if (!auction) {
+    res.status(503).json({ error: "AUCTION_ADDRESS not configured on this server." });
+    return;
+  }
+
+  console.log(`[x402/auction] Verifying payment tx ${txHash}...`);
+  const result = await verifyPayment(provider, txHash, DATA_PAYMENT_TOKEN, PAYMENT_ADDRESS, DATA_FEE);
+  if (!result.ok) {
+    res.status(402).json({ granted: false, error: result.reason });
+    return;
+  }
+
+  try {
+    const activeIds: bigint[] = await auction.getActiveAuctions();
+
+    const auctions = await Promise.all(
+      activeIds.map(async (id) => {
+        const [borrower, startPrice, floorPrice, startTime] = await auction.auctions(id);
+        const currentPrice: bigint = await auction.getCurrentPrice(id);
+        const elapsed = Math.floor(Date.now() / 1000) - Number(startTime);
+        const endsAt = Number(startTime) + 3600; // 1 hour auction
+        return {
+          auctionId: id.toString(),
+          borrower,
+          startPrice: ethers.formatEther(startPrice),
+          floorPrice: ethers.formatEther(floorPrice),
+          currentPrice: ethers.formatEther(currentPrice),
+          discountPct: (100 - (Number(currentPrice) * 100 / Number(startPrice))).toFixed(1),
+          startTime: Number(startTime),
+          endsAt,
+          secondsRemaining: Math.max(0, endsAt - Math.floor(Date.now() / 1000)),
+        };
+      })
+    );
+
+    console.log(`[x402/auction] Payment verified — returning ${auctions.length} active auction(s)`);
+    res.status(200).json({
+      granted: true,
+      count: auctions.length,
+      auctions,
+      note: "Call auction.submitBid(auctionId, encMaxBid, proof) with ETH deposit >= floorPrice to participate.",
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: "Failed to fetch auction data.", detail: e.message });
+  }
+});
+
 // ── GET /v1/grants ─────────────────────────────────────────────────────────────
-// Admin — list every (agent, borrower) pair that has been granted access.
 app.get("/v1/grants", (_req: Request, res: Response) => {
   res.json({ count: allGrants().length, grants: allGrants() });
 });
@@ -243,20 +360,19 @@ loadGrants();
 
 const port = parseInt(SERVER_PORT);
 app.listen(port, () => {
-  const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - s.length));
   console.log(`
 ╔══════════════════════════════════════════════════════╗
 ║          Lendza  x402  Payment  Server               ║
 ╠══════════════════════════════════════════════════════╣
-║  ${pad(`Listening  : http://localhost:${port}`, 52)}║
-║  ${pad(`Vault      : ${VAULT_ADDRESS.slice(0, 30)}...`, 52)}║
-║  ${pad(`Pay to     : ${PAYMENT_ADDRESS.slice(0, 30)}...`, 52)}║
-║  ${pad(`Fee        : ${(Number(FEE) / 1e6).toFixed(2)} USDC`, 52)}║
+║  Listening  : http://localhost:${port.toString().padEnd(22)}║
+║  Vault      : ${VAULT_ADDRESS.slice(0, 20)}...${" ".repeat(13)}║
+║  Auction    : ${(AUCTION_ADDRESS || "not set").slice(0, 20).padEnd(23)}║
 ╠══════════════════════════════════════════════════════╣
-║  POST /v1/alpha          probe — 200 or 402          ║
-║  POST /v1/alpha/confirm  submit payment proof        ║
-║  GET  /v1/grants         list all granted pairs      ║
-║  GET  /health            liveness check              ║
+║  POST /v1/alpha                  10 USDC             ║
+║  POST /v1/positions/unhealthy    0.05 USDC           ║
+║  POST /v1/auction/access         0.05 USDC           ║
+║  GET  /v1/grants                 admin               ║
+║  GET  /health                    liveness            ║
 ╚══════════════════════════════════════════════════════╝
 `);
 });
