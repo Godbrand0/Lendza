@@ -137,7 +137,7 @@ export function useVaultPosition(): VaultPosition {
     );
 
     // Ethers v6 signTypedData MUST NOT receive EIP712Domain in types
-    const { EIP712Domain: _ignored, ...typesForSigning } = eip712.types;
+    const { EIP712Domain: _ignored, ...typesForSigning } = eip712.types as unknown as Record<string, import('ethers').TypedDataField[]>;
 
     const signature = await signer.signTypedData(
       eip712.domain,
