@@ -8,66 +8,54 @@ import {ConfidentialCollateral} from "../tokens/ConfidentialCollateral.sol";
 import {ConfidentialDebt} from "../tokens/ConfidentialDebt.sol";
 
 /// @title ConfidentialVault
-/// @notice Core lending vault for ARGEN × ZAMA.
+///
+///  Privacy model
+///  ─────────────
+///  Amounts are stored in two parallel tracks:
+///
+///  1. FHE-encrypted (euint64)
+///     • cUSDC token   — borrower's debt, used for health checks & balance reveal
+///     • cETH token    — collateral receipt, used for health checks
+///     • _lenderBalance — lender's deposit, used for balance reveal
+///     Only the holder can decrypt these via Zama KMS userDecrypt.
+///
+///  2. Private plaintext (uint256 private)
+///     • _borrowPrincipal — used internally for USDC routing & interest math
+///     • _lenderPrincipal — used internally for USDC routing & interest math
+///     No public getter exists. Not readable via normal contract calls.
+///     (raw eth_getStorageAt can still reach them — true calldata privacy
+///     requires confidential ERC-20 which is out of scope here.)
+///
+///  Aggregate pool metrics (totalLenderDeposits, totalInterestAccrued) are
+///  public — they reveal pool size but not individual balances.
 ///
 ///  ┌─ Borrower flow ────────────────────────────────────────────────────────┐
-///  │  1. borrow(encAmount, proof) + msg.value (ETH collateral)              │
-///  │     → mints cETH (collateral token) to borrower                       │
-///  │     → mints cUSDC (debt token) to borrower                            │
-///  │  2. repay(encAmount, proof)                                            │
-///  │     → burns cUSDC debt, releases ETH collateral                       │
+///  │  1. depositCollateral() + msg.value                                    │
+///  │  2. borrow(encAmount, proof, amountPlain, durationMinutes)             │
+///  │     → mints cETH receipt, mints cUSDC debt, sends real USDC           │
+///  │  3. repay()  ← approve vault for totalDue first                       │
+///  │     → pulls USDC (principal + interest), releases ETH                 │
 ///  └────────────────────────────────────────────────────────────────────────┘
 ///
 ///  ┌─ Lender flow ──────────────────────────────────────────────────────────┐
-///  │  depositLiquidity(encAmount, proof) — supply cUSDC to the pool        │
+///  │  1. depositLiquidity(encAmount, proof, amountPlain) ← approve first   │
+///  │  2. withdrawLiquidity(amount)                                          │
+///  │     pass type(uint256).max to withdraw everything without             │
+///  │     revealing your balance in calldata                                 │
 ///  └────────────────────────────────────────────────────────────────────────┘
-///
-///  ┌─ Health factor (on-chain FHE, no Circom) ──────────────────────────────┐
-///  │  unhealthy = (collateral_gwei × price × 100) < (debt_usdc × 150_000)  │
-///  │                                                                        │
-///  │  Scaling rationale (avoids euint64 overflow):                          │
-///  │    collateral_gwei × price_int × 100  max ≈ 1.8e17  ✓                 │
-///  │    debt_usdc × 150_000                max ≈ 1.8e17  ✓                 │
-///  │                                                                        │
-///  │  price_int = Chainlink 8-dec price / 1e8  (e.g. 3000 for $3,000)      │
-///  └────────────────────────────────────────────────────────────────────────┘
-///
-///  ┌─ Liquidation ──────────────────────────────────────────────────────────┐
-///  │  1. Monitor agent calls requestLiquidationCheck(borrower)              │
-///  │     → FHE health check computed on-chain                               │
-///  │     → FHE.makePubliclyDecryptable(isUnhealthy) emits handle            │
-///  │  2. Zama relayer calls resolveHealthCheck(borrower, result, proof)     │
-///  │     → if unhealthy: DutchAuction.startAuction() triggered             │
-///  │     → trigger agent earns TRIGGER_FEE_BPS of collateral ETH            │
-///  └────────────────────────────────────────────────────────────────────────┘
-///
-/// @dev Security note: tx.origin is used only for trigger-fee attribution,
-///      NOT for access control. This is intentional per the README.
 contract ConfidentialVault is ZamaEthereumConfig {
+
     // ─────────────────────────────────────────────────────────────────────────
     // Constants
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Zama relayer address on Sepolia that calls resolveHealthCheck().
-    ///         Source: https://docs.zama.org/protocol — DECRYPTION_ADDRESS.
     address public constant DECRYPTION_ADDRESS = 0x5D8BD78e2ea6bbE41f26dFe9fdaEAa349e077478;
 
-    /// @notice LTV threshold constant. Position is unhealthy when
-    ///         collateralValue * 100 < debtValue * LIQUIDATION_THRESHOLD.
-    uint64 public constant LIQUIDATION_THRESHOLD = 150_000;
-
-    /// @notice Multiplier applied to collateral side of health check.
-    uint64 public constant HEALTH_MULTIPLIER = 100;
-
-    /// @notice Trigger agent receives 1% of collateral ETH as a fee.
-    uint256 public constant TRIGGER_FEE_BPS = 100; // 1%
-
-    /// @notice Interest rate per minute in basis points (100 bps = 1%/min for demo).
+    uint64  public constant LIQUIDATION_THRESHOLD  = 150_000;
+    uint64  public constant HEALTH_MULTIPLIER      = 100;
+    uint256 public constant TRIGGER_FEE_BPS        = 100;
     uint256 public constant INTEREST_BPS_PER_MINUTE = 100;
-
-    /// @notice Hardcoded ETH price in USD (integer, e.g. 3000 = $3,000).
-    ///         Used for the on-chain FHE health check. Good enough for demo.
-    uint64 public constant ETH_PRICE_USD = 3000;
+    uint64  public constant ETH_PRICE_USD          = 3000;
 
     // ─────────────────────────────────────────────────────────────────────────
     // State
@@ -76,45 +64,54 @@ contract ConfidentialVault is ZamaEthereumConfig {
     address public owner;
     ConfidentialCollateral public cETH;
     ConfidentialDebt public cUSDC;
+    IERC20 public mockUsdc;
     address public auctionContract;
 
-    /// @dev Tracks all borrowers that have opened a borrow position.
+    // ── Position tracking ────────────────────────────────────────────────────
+
     address[] private _activePositions;
     mapping(address => bool) private _isActive;
-
-    /// @dev Tracks whether an address has deposited collateral (may or may not have borrowed).
     mapping(address => bool) public hasCollateral;
 
-    /// @dev ETH deposited as collateral per borrower (plaintext gwei for ETH accounting).
+    /// @dev Plaintext ETH collateral — needed for msg.value math. ETH txs are
+    ///      inherently public so storing this as plaintext is acceptable.
     mapping(address => uint256) public collateralGwei;
 
-    /// @dev Loan term and start time per borrower.
+    /// @dev Private plaintext principal — NEVER exposed via a public getter.
+    ///      Used only inside repay() for USDC routing and interest computation.
+    mapping(address => uint256) private _borrowPrincipal;
+
     mapping(address => uint256) public loanStartTime;
     mapping(address => uint256) public loanTermSeconds;
 
-    /// @dev Pending health-check ebool handles, awaiting relayer decryption.
-    mapping(address => ebool) private _pendingHealthCheck;
+    // ── Liquidation ──────────────────────────────────────────────────────────
 
-    /// @dev Tracks whether a health-check is currently pending for a borrower.
-    ///      Separate bool required because `delete` cannot be applied to ebool.
-    mapping(address => bool) private _hasPendingCheck;
-
-    /// @dev Agent address that triggered a given health check (for fee attribution).
+    mapping(address => ebool)   private _pendingHealthCheck;
+    mapping(address => bool)    private _hasPendingCheck;
     mapping(address => address) private _triggerAgent;
 
-    /// @dev Lender liquidity balances (encrypted USDC).
+    // ── Lender ───────────────────────────────────────────────────────────────
+
+    /// @dev FHE-encrypted lender balance — for privacy reveal UI only.
     mapping(address => euint64) private _lenderBalance;
 
-    /// @dev Tracks lender addresses for count reporting.
+    /// @dev Private plaintext deposit — NEVER exposed via a public getter.
+    ///      Used only inside withdrawLiquidity() for USDC routing.
+    mapping(address => uint256) private _lenderPrincipal;
+
     address[] private _lenderAddresses;
-    /// @notice True if an address has ever deposited liquidity as a lender.
     mapping(address => bool) public isLender;
 
-    /// @dev Running plaintext total of ETH collateral (in gwei) across all depositors.
-    uint256 public totalCollateralGwei;
+    // ── Pool accounting ──────────────────────────────────────────────────────
 
-    /// @dev ETH received from auction settlements — stays in vault to back lenders.
+    uint256 public totalCollateralGwei;
     uint256 public protocolEthEarnings;
+
+    /// @dev Sum of all active lender deposits (for pro-rata interest splits).
+    uint256 public totalLenderDeposits;
+
+    /// @dev Accumulated interest from repayments not yet withdrawn by lenders.
+    uint256 public totalInterestAccrued;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Events
@@ -125,6 +122,7 @@ contract ConfidentialVault is ZamaEthereumConfig {
     event Borrowed(address indexed borrower);
     event Repaid(address indexed borrower);
     event LiquidityDeposited(address indexed lender);
+    event LiquidityWithdrawn(address indexed lender);
     event LiquidationCheckRequested(address indexed borrower, ebool isUnhealthy);
     event HealthCheckResolved(address indexed borrower, bool isUnhealthy);
     event LiquidationStarted(address indexed borrower);
@@ -145,9 +143,13 @@ contract ConfidentialVault is ZamaEthereumConfig {
     error ZeroCollateral();
     error InvalidDuration();
     error LoanOverdue();
+    error InsufficientPoolLiquidity();
+    error NoLenderDeposit();
+    error ZeroAmount();
+    error ExceedsAvailableBalance();
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Constructor
+    // Modifiers
     // ─────────────────────────────────────────────────────────────────────────
 
     modifier onlyDecryptor() {
@@ -155,10 +157,15 @@ contract ConfidentialVault is ZamaEthereumConfig {
         _;
     }
 
-    constructor(address _cETH, address _cUSDC) {
+    // ─────────────────────────────────────────────────────────────────────────
+    // Constructor
+    // ─────────────────────────────────────────────────────────────────────────
+
+    constructor(address _cETH, address _cUSDC, address _mockUsdc) {
         owner = msg.sender;
-        cETH = ConfidentialCollateral(_cETH);
+        cETH  = ConfidentialCollateral(_cETH);
         cUSDC = ConfidentialDebt(_cUSDC);
+        mockUsdc = IERC20(_mockUsdc);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -171,263 +178,348 @@ contract ConfidentialVault is ZamaEthereumConfig {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Borrower: step 1 — deposit / withdraw collateral
+    // Borrower: collateral
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Deposit Sepolia ETH as collateral. Can be called multiple times to top up.
     function depositCollateral() external payable {
         if (msg.value == 0) revert ZeroCollateral();
 
-        uint256 gweiDeposited = msg.value / 1 gwei;
-        collateralGwei[msg.sender] += gweiDeposited;
+        uint256 gwei_ = msg.value / 1 gwei;
+        collateralGwei[msg.sender] += gwei_;
         hasCollateral[msg.sender] = true;
-        totalCollateralGwei += gweiDeposited;
+        totalCollateralGwei += gwei_;
 
-        // Mint encrypted cETH receipt to borrower (mint adds to existing balance).
-        euint64 encCollateral = FHE.asEuint64(uint64(gweiDeposited));
-        FHE.allowTransient(encCollateral, address(cETH));
-        cETH.mint(msg.sender, encCollateral);
+        euint64 enc = FHE.asEuint64(uint64(gwei_));
+        FHE.allowTransient(enc, address(cETH));
+        cETH.mint(msg.sender, enc);
 
-        emit CollateralDeposited(msg.sender, gweiDeposited);
+        emit CollateralDeposited(msg.sender, gwei_);
     }
 
-    /// @notice Withdraw collateral before borrowing. Reverts if debt is outstanding.
     function withdrawCollateral() external {
         if (!hasCollateral[msg.sender]) revert NoCollateral();
         if (_isActive[msg.sender]) revert ActiveDebt();
 
-        uint256 gweiToReturn = collateralGwei[msg.sender];
+        uint256 gwei_ = collateralGwei[msg.sender];
 
-        // Burn cETH receipt.
-        euint64 encCollateral = FHE.asEuint64(uint64(gweiToReturn));
-        FHE.allowTransient(encCollateral, address(cETH));
-        cETH.burn(msg.sender, encCollateral);
+        euint64 enc = FHE.asEuint64(uint64(gwei_));
+        FHE.allowTransient(enc, address(cETH));
+        cETH.burn(msg.sender, enc);
 
-        totalCollateralGwei -= gweiToReturn;
+        totalCollateralGwei -= gwei_;
         collateralGwei[msg.sender] = 0;
         hasCollateral[msg.sender] = false;
 
-        (bool ok, ) = msg.sender.call{value: gweiToReturn * 1 gwei}("");
+        (bool ok,) = msg.sender.call{value: gwei_ * 1 gwei}("");
         require(ok, "ETH transfer failed");
 
-        emit CollateralWithdrawn(msg.sender, gweiToReturn);
+        emit CollateralWithdrawn(msg.sender, gwei_);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Borrower: step 2 — borrow / repay USDC
+    // Borrower: borrow / repay
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Borrow encrypted USDC against already-deposited ETH collateral.
-    /// @param encBorrowAmount  Client-side FHE-encrypted borrow amount (USDC 6-dec units).
-    /// @param inputProof       Proof generated by fhevmjs alongside the ciphertext.
-    /// @param durationMinutes  Loan term in minutes (1–1440). Use small values for demo.
+    /// @notice Borrow mock USDC against deposited ETH collateral.
+    /// @param encBorrowAmount  FHE-encrypted borrow amount (stored in cUSDC for
+    ///                         health checks and balance reveal).
+    /// @param inputProof       Proof from fhevmjs.
+    /// @param borrowAmountPlain Plaintext amount used to transfer real USDC.
+    ///                         Visible in calldata but NOT stored in any public
+    ///                         mapping — state privacy is preserved.
+    /// @param durationMinutes  Loan term (1–1440 min).
     function borrow(
         externalEuint64 encBorrowAmount,
         bytes calldata inputProof,
+        uint256 borrowAmountPlain,
         uint256 durationMinutes
     ) external {
         if (!hasCollateral[msg.sender]) revert NoCollateral();
         if (_isActive[msg.sender]) revert PositionActive();
         if (durationMinutes == 0 || durationMinutes > 1440) revert InvalidDuration();
+        if (borrowAmountPlain == 0) revert ZeroAmount();
+        if (mockUsdc.balanceOf(address(this)) < borrowAmountPlain) revert InsufficientPoolLiquidity();
 
-        // Validate and decrypt the borrow amount inside the coprocessor.
-        euint64 borrowAmount = FHE.fromExternal(encBorrowAmount, inputProof);
+        // Store plaintext principal privately — used only in repay().
+        _borrowPrincipal[msg.sender] = borrowAmountPlain;
 
-        // Record loan term.
-        loanStartTime[msg.sender] = block.timestamp;
+        loanStartTime[msg.sender]  = block.timestamp;
         loanTermSeconds[msg.sender] = durationMinutes * 60;
 
-        // Mint cUSDC debt to borrower.
-        FHE.allowTransient(borrowAmount, address(cUSDC));
-        cUSDC.mint(msg.sender, borrowAmount);
+        // Mint FHE-encrypted cUSDC for health checks and balance reveals.
+        euint64 encAmt = FHE.fromExternal(encBorrowAmount, inputProof);
+        FHE.allowTransient(encAmt, address(cUSDC));
+        cUSDC.mint(msg.sender, encAmt);
 
-        // Track active borrow position.
         _isActive[msg.sender] = true;
         _activePositions.push(msg.sender);
+
+        // Transfer real USDC from pool to borrower.
+        mockUsdc.transfer(msg.sender, borrowAmountPlain);
 
         emit Borrowed(msg.sender);
     }
 
-    /// @notice Repay encrypted USDC debt and reclaim ETH collateral.
-    /// @param encRepayAmount  Encrypted USDC amount to repay.
-    /// @param inputProof      Proof from fhevmjs.
-    function repay(externalEuint64 encRepayAmount, bytes calldata inputProof) external {
+    /// @notice Repay debt and reclaim ETH collateral.
+    ///         The exact repayment amount is computed on-chain from the private
+    ///         principal + accrued interest. Caller must first approve this
+    ///         contract for at least that amount on the mock USDC token.
+    ///         Call getMyTotalDue() with your connected wallet to get the figure.
+    function repay() external {
         if (!_isActive[msg.sender]) revert NoCollateral();
 
-        // Block repay once the loan term has expired — position must be liquidated.
         uint256 dueTime = loanStartTime[msg.sender] + loanTermSeconds[msg.sender];
         if (block.timestamp > dueTime) revert LoanOverdue();
 
-        euint64 repayAmount = FHE.fromExternal(encRepayAmount, inputProof);
+        uint256 principal = _borrowPrincipal[msg.sender];
+        uint256 elapsed   = (block.timestamp - loanStartTime[msg.sender]) / 60;
+        uint256 interest  = (principal * INTEREST_BPS_PER_MINUTE * elapsed) / 10_000;
+        uint256 totalDue  = principal + interest;
 
-        // Burn debt.
-        FHE.allowTransient(repayAmount, address(cUSDC));
-        cUSDC.burn(msg.sender, repayAmount);
+        // Pull repayment — borrower must have approved vault for totalDue.
+        mockUsdc.transferFrom(msg.sender, address(this), totalDue);
 
-        // Burn collateral token and release ETH.
-        euint64 encCollateral = FHE.asEuint64(uint64(collateralGwei[msg.sender]));
-        FHE.allowTransient(encCollateral, address(cETH));
-        cETH.burn(msg.sender, encCollateral);
+        // Route interest to lender pool.
+        totalInterestAccrued += interest;
+
+        // Wipe encrypted debt (health check state cleanup).
+        cUSDC.wipe(msg.sender);
+
+        // Burn cETH receipt and release ETH.
+        euint64 encColl = FHE.asEuint64(uint64(collateralGwei[msg.sender]));
+        FHE.allowTransient(encColl, address(cETH));
+        cETH.burn(msg.sender, encColl);
 
         uint256 ethToReturn = collateralGwei[msg.sender] * 1 gwei;
-        totalCollateralGwei -= collateralGwei[msg.sender];
-        collateralGwei[msg.sender] = 0;
-        _isActive[msg.sender] = false;
-        hasCollateral[msg.sender] = false;
+        totalCollateralGwei          -= collateralGwei[msg.sender];
+        collateralGwei[msg.sender]    = 0;
+        _borrowPrincipal[msg.sender]  = 0;
+        _isActive[msg.sender]         = false;
+        hasCollateral[msg.sender]     = false;
         _removePosition(msg.sender);
 
-        (bool ok, ) = msg.sender.call{value: ethToReturn}("");
+        (bool ok,) = msg.sender.call{value: ethToReturn}("");
         require(ok, "ETH transfer failed");
 
         emit Repaid(msg.sender);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Lender: deposit liquidity
+    // Lender: deposit / withdraw
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Lender supplies encrypted USDC to the pool.
-    function depositLiquidity(externalEuint64 encAmount, bytes calldata inputProof) external {
-        euint64 amount = FHE.fromExternal(encAmount, inputProof);
+    /// @notice Supply mock USDC to the lending pool.
+    ///         Caller must first approve this contract for `amountPlain` USDC.
+    /// @param encAmount   FHE-encrypted amount (stored for balance reveal UI).
+    /// @param inputProof  Proof from fhevmjs.
+    /// @param amountPlain Plaintext amount for the actual transferFrom.
+    ///                    Visible in calldata but NOT in any public mapping.
+    function depositLiquidity(
+        externalEuint64 encAmount,
+        bytes calldata inputProof,
+        uint256 amountPlain
+    ) external {
+        if (amountPlain == 0) revert ZeroAmount();
 
+        // Pull real USDC into the vault.
+        mockUsdc.transferFrom(msg.sender, address(this), amountPlain);
+
+        // Track privately for pro-rata interest distribution.
+        _lenderPrincipal[msg.sender] += amountPlain;
+        totalLenderDeposits += amountPlain;
+
+        // Mint FHE-encrypted balance for the reveal UI.
+        euint64 encAmt = FHE.fromExternal(encAmount, inputProof);
         if (FHE.isInitialized(_lenderBalance[msg.sender])) {
-            _lenderBalance[msg.sender] = FHE.add(_lenderBalance[msg.sender], amount);
+            _lenderBalance[msg.sender] = FHE.add(_lenderBalance[msg.sender], encAmt);
         } else {
-            _lenderBalance[msg.sender] = amount;
-            // Track new lender.
+            _lenderBalance[msg.sender] = encAmt;
             if (!isLender[msg.sender]) {
                 isLender[msg.sender] = true;
                 _lenderAddresses.push(msg.sender);
             }
         }
-
         FHE.allowThis(_lenderBalance[msg.sender]);
         FHE.allow(_lenderBalance[msg.sender], msg.sender);
 
         emit LiquidityDeposited(msg.sender);
     }
 
-    /// @notice Returns the encrypted lender balance handle for `account`.
-    ///         Caller must hold an FHE.allow grant (i.e., be the account) to userDecrypt it.
+    /// @notice Withdraw deposited USDC plus pro-rata accrued interest.
+    ///
+    ///         Pass `type(uint256).max` to withdraw everything — this reveals
+    ///         nothing about your balance in calldata.
+    ///
+    ///         Pass a specific amount for a partial withdrawal (the amount will
+    ///         be visible in calldata — a conscious privacy trade-off).
+    ///
+    ///         Payout is split proportionally between principal and interest so
+    ///         partial withdrawals are fair across both buckets.
+    function withdrawLiquidity(uint256 amount) external {
+        uint256 deposit = _lenderPrincipal[msg.sender];
+        if (deposit == 0) revert NoLenderDeposit();
+
+        uint256 interestShare = totalLenderDeposits > 0
+            ? (deposit * totalInterestAccrued) / totalLenderDeposits
+            : 0;
+        uint256 maxPayout = deposit + interestShare;
+
+        // Sentinel: type(uint256).max means "withdraw everything".
+        uint256 payout = (amount == type(uint256).max) ? maxPayout : amount;
+        if (payout > maxPayout) revert ExceedsAvailableBalance();
+        if (mockUsdc.balanceOf(address(this)) < payout) revert InsufficientPoolLiquidity();
+
+        if (payout == maxPayout) {
+            // ── Full withdrawal ──────────────────────────────────────────────
+            totalLenderDeposits -= deposit;
+            totalInterestAccrued = interestShare <= totalInterestAccrued
+                ? totalInterestAccrued - interestShare : 0;
+            _lenderPrincipal[msg.sender] = 0;
+
+            // Zero out the encrypted balance.
+            _lenderBalance[msg.sender] = FHE.asEuint64(0);
+        } else {
+            // ── Partial withdrawal ───────────────────────────────────────────
+            // Split payout proportionally: principalOut / interestOut = deposit / interestShare
+            uint256 principalOut = maxPayout > 0 ? (payout * deposit) / maxPayout : payout;
+            uint256 interestOut  = payout - principalOut;
+
+            totalLenderDeposits          -= principalOut;
+            totalInterestAccrued          = interestOut <= totalInterestAccrued
+                ? totalInterestAccrued - interestOut : 0;
+            _lenderPrincipal[msg.sender] -= principalOut;
+
+            // Reduce encrypted balance by principalOut so reveal stays accurate.
+            euint64 encOut = FHE.asEuint64(uint64(principalOut));
+            _lenderBalance[msg.sender] = FHE.sub(_lenderBalance[msg.sender], encOut);
+        }
+
+        FHE.allowThis(_lenderBalance[msg.sender]);
+        FHE.allow(_lenderBalance[msg.sender], msg.sender);
+
+        mockUsdc.transfer(msg.sender, payout);
+
+        emit LiquidityWithdrawn(msg.sender);
+    }
+
     function getLenderBalanceHandle(address account) external view returns (euint64) {
         return _lenderBalance[account];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Self-service view helpers (msg.sender scoped)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice Returns the exact USDC amount the caller owes right now.
+    ///         Uses msg.sender so each wallet only sees its own data.
+    ///         Use this to determine how much USDC to approve before repay().
+    function getMyTotalDue()
+        external
+        view
+        returns (uint256 totalDue, uint256 principal, uint256 interest)
+    {
+        if (!_isActive[msg.sender]) return (0, 0, 0);
+        principal = _borrowPrincipal[msg.sender];
+        uint256 elapsed = (block.timestamp - loanStartTime[msg.sender]) / 60;
+        interest  = (principal * INTEREST_BPS_PER_MINUTE * elapsed) / 10_000;
+        totalDue  = principal + interest;
+    }
+
+    /// @notice Returns the caller's lender position: deposit, interest share, total payout.
+    ///         Uses msg.sender so only you can read your own data via this function.
+    function getMyLenderInfo()
+        external
+        view
+        returns (uint256 deposit, uint256 interestShare, uint256 totalPayout)
+    {
+        deposit = _lenderPrincipal[msg.sender];
+        interestShare = totalLenderDeposits > 0
+            ? (deposit * totalInterestAccrued) / totalLenderDeposits
+            : 0;
+        totalPayout = deposit + interestShare;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Liquidation: health check
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Monitor agent calls this to submit a position for FHE health evaluation.
-    ///         The result is an encrypted boolean handed to the Zama relayer for decryption.
-    /// @dev tx.origin captures the EOA that paid gas — used only for fee attribution.
     function requestLiquidationCheck(address borrower) external {
         if (!_isActive[borrower]) revert NoCollateral();
         if (_hasPendingCheck[borrower]) revert AlreadyPendingCheck();
 
-        uint64 price = ETH_PRICE_USD;
-
-        // Retrieve encrypted handles owned by this contract.
         euint64 encCollateral = cETH.confidentialBalanceOf(borrower);
-        euint64 encDebt = cUSDC.confidentialBalanceOf(borrower);
+        euint64 encDebt       = cUSDC.confidentialBalanceOf(borrower);
 
-        // Health formula:
-        //   unhealthy = (collateral_gwei × price × 100) < (debt_usdc × 150_000)
-        euint64 collateralValue = FHE.mul(encCollateral, FHE.asEuint64(price * HEALTH_MULTIPLIER));
-        euint64 debtThreshold = FHE.mul(encDebt, FHE.asEuint64(LIQUIDATION_THRESHOLD));
-        ebool isUnhealthy = FHE.lt(collateralValue, debtThreshold);
+        euint64 collateralValue = FHE.mul(encCollateral, FHE.asEuint64(ETH_PRICE_USD * HEALTH_MULTIPLIER));
+        euint64 debtThreshold   = FHE.mul(encDebt, FHE.asEuint64(LIQUIDATION_THRESHOLD));
+        ebool isUnhealthy       = FHE.lt(collateralValue, debtThreshold);
 
-        // Persist handle so resolveHealthCheck() can verify the proof.
         _pendingHealthCheck[borrower] = isUnhealthy;
-        _hasPendingCheck[borrower] = true;
+        _hasPendingCheck[borrower]    = true;
         FHE.allowThis(isUnhealthy);
-
-        // Hand handle to the Zama relayer for public decryption.
         FHE.makePubliclyDecryptable(isUnhealthy);
 
-        // Store trigger agent for fee payment on successful liquidation.
         _triggerAgent[borrower] = tx.origin;
 
         emit LiquidationCheckRequested(borrower, isUnhealthy);
     }
 
-    /// @notice Called by the Zama relayer once the Gateway has decrypted the health check.
-    /// @param borrower             The position being checked.
-    /// @param abiEncodedClearResult  ABI-encoded bool from the Gateway.
-    /// @param decryptionProof      Signature proof from KMS verifier.
     function resolveHealthCheck(
         address borrower,
         bytes calldata abiEncodedClearResult,
         bytes calldata decryptionProof
     ) external onlyDecryptor {
-        ebool pendingCheck = _pendingHealthCheck[borrower];
         if (!_hasPendingCheck[borrower]) revert NoPendingCheck();
 
-        // Verify the decryption proof against the stored handle.
         bytes32[] memory cts = new bytes32[](1);
-        cts[0] = FHE.toBytes32(pendingCheck);
+        cts[0] = FHE.toBytes32(_pendingHealthCheck[borrower]);
         FHE.checkSignatures(cts, abiEncodedClearResult, decryptionProof);
 
         bool isUnhealthy = abi.decode(abiEncodedClearResult, (bool));
-
-        // Clear the pending check.
         _hasPendingCheck[borrower] = false;
 
         emit HealthCheckResolved(borrower, isUnhealthy);
-
-        if (isUnhealthy) {
-            _triggerLiquidation(borrower);
-        }
+        if (isUnhealthy) _triggerLiquidation(borrower);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Liquidation: settlement (called back by DutchAuction)
+    // Liquidation: settlement
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice DutchAuction calls this when a bid is settled to close the position.
-    /// @param borrower  Position being liquidated.
-    /// @param bidder    Winning bidder — receives collateral.
-    /// @param ethPaid   ETH (in wei) received from the bidder.
     function settleLiquidation(address borrower, address bidder, uint256 ethPaid) external {
         if (msg.sender != auctionContract) revert OnlyAuction();
 
         uint256 collateralEth = collateralGwei[borrower] * 1 gwei;
+        uint256 triggerFee    = (collateralEth * TRIGGER_FEE_BPS) / 10_000;
+        address triggerAgent  = _triggerAgent[borrower];
 
-        // Pay trigger fee (1%) to the agent that flagged the position.
-        uint256 triggerFee = (collateralEth * TRIGGER_FEE_BPS) / 10_000;
-        address triggerAgent = _triggerAgent[borrower];
-
-        // Wipe debt and burn collateral token.
         cUSDC.wipe(borrower);
-        euint64 encCollateral = FHE.asEuint64(uint64(collateralGwei[borrower]));
-        FHE.allowTransient(encCollateral, address(cETH));
-        cETH.burn(borrower, encCollateral);
 
-        // Close position.
-        totalCollateralGwei -= collateralGwei[borrower];
-        collateralGwei[borrower] = 0;
-        _isActive[borrower] = false;
-        hasCollateral[borrower] = false;
+        euint64 encColl = FHE.asEuint64(uint64(collateralGwei[borrower]));
+        FHE.allowTransient(encColl, address(cETH));
+        cETH.burn(borrower, encColl);
+
+        totalCollateralGwei         -= collateralGwei[borrower];
+        collateralGwei[borrower]     = 0;
+        _borrowPrincipal[borrower]   = 0;
+        _isActive[borrower]          = false;
+        hasCollateral[borrower]      = false;
         _removePosition(borrower);
         delete _triggerAgent[borrower];
 
-        // Transfer trigger fee.
         if (triggerFee > 0 && triggerAgent != address(0)) {
-            (bool ok, ) = triggerAgent.call{value: triggerFee}("");
+            (bool ok,) = triggerAgent.call{value: triggerFee}("");
             require(ok, "Trigger fee transfer failed");
         }
 
-        // Track protocol ETH earnings from auction settlement.
-        // Remaining ETH after trigger fee stays in vault to back lenders.
-        uint256 remaining = ethPaid - triggerFee;
-        protocolEthEarnings += remaining;
+        protocolEthEarnings += ethPaid - triggerFee;
+        bidder; // receives collateral via auction contract
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Access control: x402 server grants
+    // Access control
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice x402 server calls this after receiving payment to give `agent` read
-    ///         access to `account`'s encrypted position handles.
     function grantAgentAccess(address account, address agent) external {
         if (msg.sender != owner) revert OnlyOwner();
         cETH.grantReadAccess(account, agent);
@@ -436,19 +528,13 @@ contract ConfidentialVault is ZamaEthereumConfig {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // View helpers
+    // Public view helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Returns all addresses with active borrow positions.
-    ///         Amounts remain encrypted — only addresses are revealed.
     function getActivePositions() external view returns (address[] memory) {
         return _activePositions;
     }
 
-    /// @notice Protocol-wide plaintext stats for the dashboard.
-    /// @return totalCollateral  Total ETH collateral locked, in gwei.
-    /// @return activeBorrowers  Number of open borrow positions.
-    /// @return totalLenders     Total number of lenders that have ever deposited.
     function getProtocolStats() external view returns (
         uint256 totalCollateral,
         uint256 activeBorrowers,
@@ -456,29 +542,19 @@ contract ConfidentialVault is ZamaEthereumConfig {
     ) {
         totalCollateral = totalCollateralGwei;
         activeBorrowers = _activePositions.length;
-        totalLenders = _lenderAddresses.length;
+        totalLenders    = _lenderAddresses.length;
     }
 
-    /// @notice Returns the raw encrypted handles for a position.
-    ///         Caller must hold FHE.allow grants to reencrypt them.
     function getPositionHandles(address borrower)
-        external
-        view
+        external view
         returns (euint64 encCollateral, euint64 encDebt)
     {
         encCollateral = cETH.confidentialBalanceOf(borrower);
-        encDebt = cUSDC.confidentialBalanceOf(borrower);
+        encDebt       = cUSDC.confidentialBalanceOf(borrower);
     }
 
-    /// @notice Returns plaintext loan timing info for a borrower.
-    /// @return startTime      Unix timestamp when loan was opened.
-    /// @return termSeconds    Loan duration in seconds.
-    /// @return dueTime        Unix timestamp when loan is due.
-    /// @return isOverdue      Whether the loan term has elapsed.
-    /// @return isActive       Whether the position is open.
     function getLoanInfo(address borrower)
-        external
-        view
+        external view
         returns (
             uint256 startTime,
             uint256 termSeconds,
@@ -487,11 +563,11 @@ contract ConfidentialVault is ZamaEthereumConfig {
             bool isActive
         )
     {
-        startTime = loanStartTime[borrower];
+        startTime  = loanStartTime[borrower];
         termSeconds = loanTermSeconds[borrower];
-        dueTime = startTime + termSeconds;
-        isOverdue = startTime > 0 && block.timestamp > dueTime;
-        isActive = _isActive[borrower];
+        dueTime    = startTime + termSeconds;
+        isOverdue  = startTime > 0 && block.timestamp > dueTime;
+        isActive   = _isActive[borrower];
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -518,7 +594,12 @@ contract ConfidentialVault is ZamaEthereumConfig {
     receive() external payable {}
 }
 
-/// @dev Minimal interface used by ConfidentialVault to trigger auctions.
 interface IDutchAuction {
     function startAuction(address borrower, uint256 collateralGwei) external;
+}
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
 }

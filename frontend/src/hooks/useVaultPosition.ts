@@ -27,12 +27,21 @@ export interface VaultPosition {
   maxBorrowUsdc: number;
   loan: LoanInfo;
   isLender: boolean;
+  /** From getMyTotalDue() via signer — principal in USDC */
+  principal: number | null;
+  /** From getMyTotalDue() via signer — principal + accrued interest */
+  totalDue: number | null;
+  /** From getMyLenderInfo() via signer */
+  lenderDeposit: number | null;
+  lenderInterest: number | null;
+  lenderPayout: number | null;
+  /** FHE-decrypted debt balance (optional — for reveal UI) */
   debtUsdc: number | null;
+  /** FHE-decrypted lender balance (optional — for reveal UI) */
   lenderUsdc: number | null;
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
-  /** Clear cached decrypted values — call after a tx that changes encrypted state */
   clearDecrypted: () => void;
   decryptDebt: () => Promise<void>;
   decryptLenderBalance: () => Promise<void>;
@@ -54,6 +63,13 @@ export function useVaultPosition(): VaultPosition {
   const [collateralGwei, setCollateralGwei] = useState(0n);
   const [loan, setLoan] = useState<LoanInfo>(DEFAULT_LOAN);
   const [isLenderState, setIsLenderState] = useState(false);
+  // totalDue from getMyTotalDue() — requires signer (msg.sender scoped)
+  const [totalDueState, setTotalDue] = useState<number | null>(null);
+  const [principalState, setPrincipal] = useState<number | null>(null);
+  // lender info from getMyLenderInfo() — requires signer
+  const [lenderDepositState, setLenderDeposit] = useState<number | null>(null);
+  const [lenderInterestState, setLenderInterest] = useState<number | null>(null);
+  const [lenderPayoutState, setLenderPayout] = useState<number | null>(null);
   const [debtUsdc, setDebtUsdc] = useState<number | null>(null);
   const [lenderUsdc, setLenderUsdc] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
@@ -71,12 +87,13 @@ export function useVaultPosition(): VaultPosition {
     setError(null);
     try {
       const provider = new JsonRpcProvider(process.env.NEXT_PUBLIC_RPC_URL);
-      const vault = new Contract(VAULT_ADDRESS, VAULT_ABI, provider);
+      const vaultRead = new Contract(VAULT_ADDRESS, VAULT_ABI, provider);
+
       const [hasColl, gwei, loanInfo, lender] = await Promise.all([
-        vault.hasCollateral(account),
-        vault.collateralGwei(account),
-        vault.getLoanInfo(account),
-        vault.isLender(account),
+        vaultRead.hasCollateral(account),
+        vaultRead.collateralGwei(account),
+        vaultRead.getLoanInfo(account),
+        vaultRead.isLender(account),
       ]);
       setHasCollateral(hasColl);
       setCollateralGwei(BigInt(gwei));
@@ -88,6 +105,23 @@ export function useVaultPosition(): VaultPosition {
         isActive: loanInfo[4],
       });
       setIsLenderState(lender);
+
+      // getMyTotalDue and getMyLenderInfo use msg.sender — must be called
+      // through the signer so the RPC uses the correct `from` address.
+      if (signer) {
+        const vaultSigned = new Contract(VAULT_ADDRESS, VAULT_ABI, signer);
+        const [due, lenderInfo] = await Promise.all([
+          vaultSigned.getMyTotalDue(),
+          vaultSigned.getMyLenderInfo(),
+        ]);
+        const p = Number(due[1]);
+        setPrincipal(p > 0 ? p / 1e6 : null);
+        setTotalDue(Number(due[0]) > 0 ? Number(due[0]) / 1e6 : null);
+        const dep = Number(lenderInfo[0]);
+        setLenderDeposit(dep > 0 ? dep / 1e6 : null);
+        setLenderInterest(Number(lenderInfo[1]) > 0 ? Number(lenderInfo[1]) / 1e6 : null);
+        setLenderPayout(Number(lenderInfo[2]) > 0 ? Number(lenderInfo[2]) / 1e6 : null);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -169,6 +203,11 @@ export function useVaultPosition(): VaultPosition {
   const clearDecrypted = useCallback(() => {
     setDebtUsdc(null);
     setLenderUsdc(null);
+    setTotalDue(null);
+    setPrincipal(null);
+    setLenderDeposit(null);
+    setLenderInterest(null);
+    setLenderPayout(null);
   }, []);
 
   const decryptDebt = useCallback(async () => {
@@ -207,6 +246,11 @@ export function useVaultPosition(): VaultPosition {
     maxBorrowUsdc,
     loan,
     isLender: isLenderState,
+    principal: principalState,
+    totalDue: totalDueState,
+    lenderDeposit: lenderDepositState,
+    lenderInterest: lenderInterestState,
+    lenderPayout: lenderPayoutState,
     debtUsdc,
     lenderUsdc,
     loading,

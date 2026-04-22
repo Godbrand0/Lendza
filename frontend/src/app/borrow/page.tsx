@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { parseEther } from "ethers";
 import { useFhe } from "@/context/FheContext";
-import { vaultContract, VAULT_ADDRESS } from "@/lib/contracts";
+import { vaultContract, mockUsdcContract, VAULT_ADDRESS } from "@/lib/contracts";
 import { useVaultPosition } from "@/hooks/useVaultPosition";
 
 type TxStatus = "idle" | "pending" | "encrypting" | "success" | "error";
@@ -69,31 +69,31 @@ export default function BorrowPage() {
     return () => clearInterval(id);
   }, [position.loan?.isActive, position.loan?.dueTime]); // eslint-disable-line
 
-  // Repay — total due = debt (from reveal) + accrued interest
-  // We use elapsed time since loan start for real-time interest. If debt not
-  // yet revealed we show a placeholder and ask the user to reveal first.
+  // principal and totalDue come from getMyTotalDue() via signer (msg.sender scoped)
+  const knownDebt = position.principal;
   const elapsedMinutes = position.loan?.isActive && position.loan.startTime
     ? Math.floor((Date.now() / 1000 - position.loan.startTime) / 60)
     : 0;
-  const knownDebt = position.debtUsdc ?? null;
-  const totalDue = knownDebt !== null
-    ? knownDebt + calcInterest(knownDebt, elapsedMinutes)
-    : null;
+  // Use chain value when available; fall back to frontend estimate while loading.
+  const totalDue = position.totalDue ?? (knownDebt !== null ? knownDebt + calcInterest(knownDebt, elapsedMinutes) : null);
 
   async function handleRepay() {
-    if (!instance || !signer || !account || !VAULT_ADDRESS || totalDue === null) return;
-    setRepayStatus("encrypting");
+    if (!signer || !account || !VAULT_ADDRESS || totalDue === null) return;
+    setRepayStatus("encrypting"); // reuse state label for "approving"
     setRepayError(null);
     setRepayTxHash(null);
     try {
       const usdcUnits = BigInt(Math.round(totalDue * 1e6));
-      const input = instance.createEncryptedInput(VAULT_ADDRESS, account);
-      input.add64(usdcUnits);
-      const { handles, inputProof } = await input.encrypt();
 
+      // Step 1: approve vault to spend totalDue USDC
+      const usdc = mockUsdcContract(signer);
+      const approveTx = await usdc.approve(VAULT_ADDRESS, usdcUnits);
+      await approveTx.wait();
+
+      // Step 2: repay — vault pulls USDC and releases ETH
       setRepayStatus("pending");
       const vault = vaultContract(signer);
-      const tx = await vault.repay(handles[0], inputProof);
+      const tx = await vault.repay();
       setRepayTxHash(tx.hash);
       await tx.wait();
       setRepayStatus("success");
@@ -105,7 +105,7 @@ export default function BorrowPage() {
     }
   }
 
-  const canRepay = !!instance && !!signer && !!account && position.loan?.isActive
+  const canRepay = !!signer && !!account && position.loan?.isActive
     && !position.loan.isOverdue && totalDue !== null && repayStatus === "idle";
 
   // Derived
@@ -120,7 +120,7 @@ export default function BorrowPage() {
   const notConnected = !account || !instance;
   const canDeposit = !!signer && !!collateralEth && parseFloat(collateralEth) > 0
     && collateralStatus === "idle";
-  const canBorrow = !!instance && !!signer && !!account && position.hasCollateral
+  const canBorrow = !!signer && !!account && !!instance && position.hasCollateral
     && !position.loan?.isActive && principal > 0 && !overLimit && borrowStatus === "idle";
 
   async function handleDepositCollateral() {
@@ -142,23 +142,24 @@ export default function BorrowPage() {
   }
 
   async function handleBorrow() {
-    if (!instance || !signer || !account || !VAULT_ADDRESS || !borrowAmt) return;
+    if (!signer || !account || !instance || !VAULT_ADDRESS || !borrowAmt) return;
     setBorrowStatus("encrypting");
     setBorrowError(null);
     setBorrowTxHash(null);
     try {
       const usdcUnits = BigInt(Math.round(principal * 1e6));
+
+      // FHE-encrypt the borrow amount before it hits the chain
       const input = instance.createEncryptedInput(VAULT_ADDRESS, account);
       input.add64(usdcUnits);
       const { handles, inputProof } = await input.encrypt();
 
       setBorrowStatus("pending");
       const vault = vaultContract(signer);
-      const tx = await vault.borrow(handles[0], inputProof, BigInt(durationMinutes));
+      const tx = await vault.borrow(handles[0], inputProof, usdcUnits, BigInt(durationMinutes));
       setBorrowTxHash(tx.hash);
       await tx.wait();
       setBorrowStatus("success");
-      // Clear stale debt so reveal button shows fresh value after borrowing
       position.clearDecrypted();
     } catch (e: unknown) {
       setBorrowError(e instanceof Error ? e.message : String(e));
@@ -402,8 +403,8 @@ export default function BorrowPage() {
               <div className="space-y-3 text-sm">
                 {knownDebt === null ? (
                   <div className="flex items-center gap-2 p-3 rounded-xl bg-white/5 border border-white/10 text-xs text-gray-400">
-                    <Lock size={12} className="text-brand-cyan shrink-0" />
-                    <span>Reveal your debt first to calculate exact repayment amount.</span>
+                    <Loader2 size={12} className="animate-spin text-brand-cyan shrink-0" />
+                    <span>Loading repayment amount…</span>
                   </div>
                 ) : (
                   <div className="bg-white/3 rounded-xl p-4 space-y-2 text-xs border border-white/5">
@@ -433,8 +434,8 @@ export default function BorrowPage() {
                     disabled={!canRepay}
                     className="flex-1 py-4 rounded-2xl bg-brand-cyan text-black font-bold text-sm hover:opacity-90 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                   >
-                    {repayStatus === "encrypting" && <><Loader2 size={16} className="animate-spin" /> Encrypting…</>}
-                    {repayStatus === "pending" && <><Loader2 size={16} className="animate-spin" /> Confirming…</>}
+                    {repayStatus === "encrypting" && <><Loader2 size={16} className="animate-spin" /> Approving USDC…</>}
+                    {repayStatus === "pending" && <><Loader2 size={16} className="animate-spin" /> Repaying…</>}
                     {(repayStatus === "idle" || repayStatus === "success" || repayStatus === "error") && <><ShieldCheck size={16} /> Repay & Reclaim ETH</>}
                   </button>
                 </div>

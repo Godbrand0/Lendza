@@ -26,7 +26,11 @@ export const MOCK_USDC_ADDRESS =
 
 export const VAULT_ABI = [
   {
-    "inputs": [{ "internalType": "address", "name": "_cETH", "type": "address" }, { "internalType": "address", "name": "_cUSDC", "type": "address" }],
+    "inputs": [
+      { "internalType": "address", "name": "_cETH", "type": "address" },
+      { "internalType": "address", "name": "_cUSDC", "type": "address" },
+      { "internalType": "address", "name": "_mockUsdc", "type": "address" }
+    ],
     "stateMutability": "nonpayable",
     "type": "constructor"
   },
@@ -34,8 +38,10 @@ export const VAULT_ABI = [
   { "inputs": [], "name": "AlreadyPendingCheck", "type": "error" },
   { "inputs": [], "name": "InvalidDuration", "type": "error" },
   { "inputs": [], "name": "InvalidKMSSignatures", "type": "error" },
+  { "inputs": [], "name": "InsufficientPoolLiquidity", "type": "error" },
   { "inputs": [], "name": "LoanOverdue", "type": "error" },
   { "inputs": [], "name": "NoCollateral", "type": "error" },
+  { "inputs": [], "name": "NoLenderDeposit", "type": "error" },
   { "inputs": [], "name": "NoPendingCheck", "type": "error" },
   { "inputs": [], "name": "OnlyAuction", "type": "error" },
   { "inputs": [], "name": "OnlyDecryptor", "type": "error" },
@@ -43,6 +49,8 @@ export const VAULT_ABI = [
   { "inputs": [], "name": "PositionActive", "type": "error" },
   { "inputs": [{ "internalType": "bytes32", "name": "handle", "type": "bytes32" }, { "internalType": "address", "name": "sender", "type": "address" }], "name": "SenderNotAllowedToUseHandle", "type": "error" },
   { "inputs": [], "name": "ZamaProtocolUnsupported", "type": "error" },
+  { "inputs": [], "name": "ExceedsAvailableBalance", "type": "error" },
+  { "inputs": [], "name": "ZeroAmount", "type": "error" },
   { "inputs": [], "name": "ZeroCollateral", "type": "error" },
   {
     "anonymous": false,
@@ -70,6 +78,24 @@ export const VAULT_ABI = [
   },
   {
     "anonymous": false,
+    "inputs": [{ "indexed": true, "internalType": "address", "name": "borrower", "type": "address" }],
+    "name": "Repaid",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [{ "indexed": true, "internalType": "address", "name": "lender", "type": "address" }],
+    "name": "LiquidityDeposited",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [{ "indexed": true, "internalType": "address", "name": "lender", "type": "address" }],
+    "name": "LiquidityWithdrawn",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
     "inputs": [{ "indexed": true, "internalType": "address", "name": "borrower", "type": "address" }, { "indexed": false, "internalType": "bool", "name": "isUnhealthy", "type": "bool" }],
     "name": "HealthCheckResolved",
     "type": "event"
@@ -88,20 +114,8 @@ export const VAULT_ABI = [
   },
   {
     "anonymous": false,
-    "inputs": [{ "indexed": true, "internalType": "address", "name": "lender", "type": "address" }],
-    "name": "LiquidityDeposited",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
     "inputs": [{ "indexed": false, "internalType": "bytes32[]", "name": "handlesList", "type": "bytes32[]" }, { "indexed": false, "internalType": "bytes", "name": "abiEncodedCleartexts", "type": "bytes" }],
     "name": "PublicDecryptionVerified",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [{ "indexed": true, "internalType": "address", "name": "borrower", "type": "address" }],
-    "name": "Repaid",
     "type": "event"
   },
   {
@@ -171,11 +185,48 @@ export const VAULT_ABI = [
     "inputs": [
       { "internalType": "externalEuint64", "name": "encBorrowAmount", "type": "bytes32" },
       { "internalType": "bytes", "name": "inputProof", "type": "bytes" },
+      { "internalType": "uint256", "name": "borrowAmountPlain", "type": "uint256" },
       { "internalType": "uint256", "name": "durationMinutes", "type": "uint256" }
     ],
     "name": "borrow",
     "outputs": [],
     "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "totalLenderDeposits",
+    "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "totalInterestAccrued",
+    "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "getMyTotalDue",
+    "outputs": [
+      { "internalType": "uint256", "name": "totalDue", "type": "uint256" },
+      { "internalType": "uint256", "name": "principal", "type": "uint256" },
+      { "internalType": "uint256", "name": "interest", "type": "uint256" }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "getMyLenderInfo",
+    "outputs": [
+      { "internalType": "uint256", "name": "deposit", "type": "uint256" },
+      { "internalType": "uint256", "name": "interestShare", "type": "uint256" },
+      { "internalType": "uint256", "name": "totalPayout", "type": "uint256" }
+    ],
+    "stateMutability": "view",
     "type": "function"
   },
   {
@@ -207,8 +258,19 @@ export const VAULT_ABI = [
     "type": "function"
   },
   {
-    "inputs": [{ "internalType": "externalEuint64", "name": "encAmount", "type": "bytes32" }, { "internalType": "bytes", "name": "inputProof", "type": "bytes" }],
+    "inputs": [
+      { "internalType": "externalEuint64", "name": "encAmount", "type": "bytes32" },
+      { "internalType": "bytes", "name": "inputProof", "type": "bytes" },
+      { "internalType": "uint256", "name": "amountPlain", "type": "uint256" }
+    ],
     "name": "depositLiquidity",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "uint256", "name": "amount", "type": "uint256" }],
+    "name": "withdrawLiquidity",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -301,7 +363,7 @@ export const VAULT_ABI = [
     "type": "function"
   },
   {
-    "inputs": [{ "internalType": "externalEuint64", "name": "encRepayAmount", "type": "bytes32" }, { "internalType": "bytes", "name": "inputProof", "type": "bytes" }],
+    "inputs": [],
     "name": "repay",
     "outputs": [],
     "stateMutability": "nonpayable",
@@ -504,10 +566,39 @@ export const TOKEN_ABI = [
 // Contract factory helpers
 // ---------------------------------------------------------------------------
 
+// Minimal ERC-20 ABI for mock USDC interactions (approve + balanceOf).
+export const MOCK_USDC_ABI = [
+  {
+    "inputs": [{ "internalType": "address", "name": "spender", "type": "address" }, { "internalType": "uint256", "name": "amount", "type": "uint256" }],
+    "name": "approve",
+    "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "address", "name": "account", "type": "address" }],
+    "name": "balanceOf",
+    "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "address", "name": "to", "type": "address" }, { "internalType": "uint256", "name": "amount", "type": "uint256" }],
+    "name": "mint",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+] as const;
+
 export function vaultContract(signer: JsonRpcSigner) {
   return new Contract(VAULT_ADDRESS, VAULT_ABI, signer);
 }
 
 export function auctionContract(signer: JsonRpcSigner) {
   return new Contract(AUCTION_ADDRESS, AUCTION_ABI, signer);
+}
+
+export function mockUsdcContract(signer: JsonRpcSigner) {
+  return new Contract(MOCK_USDC_ADDRESS, MOCK_USDC_ABI, signer);
 }

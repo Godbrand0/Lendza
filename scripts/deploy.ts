@@ -58,9 +58,11 @@ async function main() {
   console.log(`      cUSDC → ${cUSDCAddress}`);
 
   // ─── 3. ConfidentialVault ────────────────────────────────────────────────────
+  // Mock USDC on Sepolia (Zama's public faucet token)
+  const MOCK_USDC = "0x9b5Cd13b8eFbB58Dc25A05CF411D8056058aDFfF";
   console.log("\n[3/4] Deploying ConfidentialVault...");
   const ConfidentialVault = await ethers.getContractFactory("ConfidentialVault");
-  const vault = await ConfidentialVault.deploy(cETHAddress, cUSDCAddress);
+  const vault = await ConfidentialVault.deploy(cETHAddress, cUSDCAddress, MOCK_USDC);
   await vault.waitForDeployment();
   const vaultAddress = await vault.getAddress();
   console.log(`      Vault → ${vaultAddress}`);
